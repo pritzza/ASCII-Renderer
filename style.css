@@ -1,0 +1,67 @@
+/* FINAL VERSION DIRECTIVE: Background is white, text is black. This should not be changed. */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    background-color: #fff; /* FINAL: White background */
+}
+
+/* The visible container that the user scrolls */
+#grid-viewport {
+    width: 100vw;
+    height: 100vh;
+    overflow: scroll;
+    position: relative;
+}
+
+/* The giant, invisible element that defines the scrollable area */
+#grid-scroller {
+    position: relative;
+    /* width and height are set dynamically by the script */
+    contain: strict;
+}
+
+/* The small window of recycled DOM nodes that is moved via transform */
+#grid-window {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: grid;
+    will-change: transform;
+    contain: strict;
+}
+
+/* A single recycled cell */
+.cell {
+    /* width and height are set dynamically by the script */
+    font-family: monospace;
+    font-size: 16px;
+    line-height: 1.0;
+    text-align: center;
+    color: #000;
+    /* Allow text selection on the recycled nodes */
+    user-select: text;
+    white-space: pre; /* Ensure whitespace is respected */
+
+    
+}
+
+/* Hidden element for measuring character size */
+#measure-parent {
+    position: absolute;
+    top: -9999px;
+    left: -9999px;
+    visibility: hidden;
+}
+
+#measure {
+    font-family: monospace;
+    font-size: 16px;
+    line-height: 1.0;
+}
