@@ -5,18 +5,32 @@
     box-sizing: border-box;
 }
 
-html, body {
+html,
+body {
     height: 100%;
     width: 100%;
     overflow: hidden;
-    background-color: #fff; /* FINAL: White background */
+    /* was: auto — prevent page scroll */
+    background-color: #fff;
+    /* FINAL: White background */
+}
+
+body {
+    display: flex;
+    /* NEW: stack viewport + preview vertically */
+    flex-direction: column;
 }
 
 /* The visible container that the user scrolls */
 #grid-viewport {
     width: 100vw;
-    height: 100vh;
+    /* height: 100vh;           REMOVE: let it size to remaining space */
+    flex: 1 1 auto;
+    /* NEW: fill leftover height above preview */
+    min-height: 0;
+    /* NEW: allows inner scroll area to shrink */
     overflow: scroll;
+    /* keeps your world-scroll behavior */
     position: relative;
 }
 
@@ -47,9 +61,8 @@ html, body {
     color: #000;
     /* Allow text selection on the recycled nodes */
     user-select: text;
-    white-space: pre; /* Ensure whitespace is respected */
-
-    
+    white-space: pre;
+    /* Ensure whitespace is respected */
 }
 
 /* Hidden element for measuring character size */
@@ -64,4 +77,30 @@ html, body {
     font-family: monospace;
     font-size: 16px;
     line-height: 1.0;
+}
+
+/* Small color preview under the ASCII render */
+#preview-wrap {
+    width: 100%;
+    display: block;
+    padding: 8px 12px 12px;
+    margin-top: 4px;
+    /* tiny gap under ASCII */
+    align-self: flex-start;
+    /* avoid stretching full width if you don’t want to */
+    /* hidden unless ?debug */
+    display: none;
+}
+
+#preview {
+    /* Render the low-res buffer sharply when scaled */
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 1px solid #000;
+    background: #fff;
+    display: inline-block;
+    width: 256px;
+    /* visual size; change to taste */
+    height: auto;
+    /* maintain aspect */
 }

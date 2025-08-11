@@ -1,39 +1,54 @@
-// js/utils.js
-
-export const vec3 = (x = 0, y = 0, z = 0) => ({ x, y, z });
-export const add = (v1, v2) => vec3(v1.x + v2.x, v1.y + v2.y, v1.z + v2.z);
-export const sub = (v1, v2) => vec3(v1.x - v2.x, v1.y - v2.y, v1.z - v2.z);
-export const scale = (v, s) => vec3(v.x * s, v.y * s, v.z * s);
-export const dot = (v1, v2) => v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
-export const cross = (v1, v2) => vec3(v1.y * v2.z - v1.z * v2.y, v1.z * v2.x - v1.x * v2.z, v1.x * v2.y - v1.y * v2.x);
-export const normalize = (v) => { const l = Math.sqrt(dot(v, v)); return l > 0 ? scale(v, 1 / l) : vec3(0, 0, 0); };
-export const lerp = (v1, v2, t) => add(scale(v1, 1 - t), scale(v2, t));
-
-export function transformPoint(p, m) { return vec3( p.x * m[0] + p.y * m[3] + p.z * m[6], p.x * m[1] + p.y * m[4] + p.z * m[7], p.x * m[2] + p.y * m[5] + p.z * m[8] ); }
-export function rotationMatrixY(angle) { const c = Math.cos(angle), s = Math.sin(angle); return [c, 0, s, 0, 1, 0, -s, 0, c]; }
-export function rotationMatrixX(angle) { const c = Math.cos(angle), s = Math.sin(angle); return [1, 0, 0, 0, c, -s, 0, s, c]; }
-
-/**
- * Packs an RGB color into a single 32-bit integer.
- */
+// ------- Color packing helpers -------
 export function packColor(r, g, b) {
     return (r << 16) | (g << 8) | b;
-}
-
-/**
- * Unpacks a 32-bit integer back into an RGB color object.
- */
-export function unpackColor(packed) {
+  }
+  export function unpackColor(packed) {
     return {
-        r: (packed >> 16) & 255,
-        g: (packed >> 8) & 255,
-        b: packed & 255,
+      r: (packed >> 16) & 255,
+      g: (packed >> 8) & 255,
+      b: packed & 255,
     };
-}
-
-/**
- * Creates a 2D array buffer of a given size, filled with a value.
- */
-export function createBuffer(width, height, fillValue) {
+  }
+  
+  // ------- 2D buffer helper -------
+  export function createBuffer(width, height, fillValue) {
     return Array.from({ length: height }, () => Array(width).fill(fillValue));
-}
+  }
+  
+  // ------- Minimal vec3 helpers (needed by camera.js & renderer) -------
+  export function vec3(x = 0, y = 0, z = 0) { return { x, y, z }; }
+  export function add(a, b)  { return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }; }
+  export function sub(a, b)  { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+  export function scale(v, s){ return { x: v.x * s,   y: v.y * s,   z: v.z * s   }; }
+  
+  export function dot(a, b)  { return a.x*b.x + a.y*b.y + a.z*b.z; }
+  export function cross(a, b){
+    return {
+      x: a.y*b.z - a.z*b.y,
+      y: a.z*b.x - a.x*b.z,
+      z: a.x*b.y - a.y*b.x
+    };
+  }
+  export function length(v)  { return Math.hypot(v.x, v.y, v.z); }
+  export function normalize(v) {
+    const L = length(v) || 1;
+    return { x: v.x / L, y: v.y / L, z: v.z / L };
+  }
+  
+  // Interpolation / math utils commonly used in shaders & UI overlays
+  export function lerp(a, b, t) { return a + (b - a) * t; }
+  export const mix = lerp;              // alias, parity with GLSL
+  export function clamp(x, min=0, max=1) { return Math.min(max, Math.max(min, x)); }
+  export function saturate(x) { return clamp(x, 0, 1); }
+  export function toRad(deg) { return deg * Math.PI / 180; }
+  export function toDeg(rad) { return rad * 180 / Math.PI; }
+  
+  // Handy vec3 extras (non-allocating patterns kept simple)
+  export function distance(a, b) { return length(sub(a, b)); }
+  export function copyVec3(v) { return { x: v.x, y: v.y, z: v.z }; }
+  export function equalsVec3(a, b, eps = 1e-6) {
+    return Math.abs(a.x - b.x) <= eps &&
+           Math.abs(a.y - b.y) <= eps &&
+           Math.abs(a.z - b.z) <= eps;
+  }
+  

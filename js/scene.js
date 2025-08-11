@@ -1,61 +1,51 @@
 // js/scene.js
-import { vec3, add, normalize, transformPoint, rotationMatrixY, rotationMatrixX } from './utils.js';
+import { createSceneBuilder, Materials } from './render/scene_api.js';
 
-function generateCubeGeometry() {
-    const v = [
-        vec3(-0.5, -0.5, -0.5), vec3(0.5, -0.5, -0.5), vec3(0.5, 0.5, -0.5), vec3(-0.5, 0.5, -0.5),
-        vec3(-0.5, -0.5, 0.5), vec3(0.5, -0.5, 0.5), vec3(0.5, 0.5, 0.5), vec3(-0.5, 0.5, 0.5),
-    ];
-    const triangles = [
-        { v0: 0, v1: 1, v2: 2 }, { v0: 0, v1: 2, v2: 3 }, { v0: 4, v1: 6, v2: 5 }, { v0: 4, v1: 7, v2: 6 },
-        { v0: 3, v1: 2, v2: 6 }, { v0: 3, v1: 6, v2: 7 }, { v0: 0, v1: 4, v2: 1 }, { v0: 1, v1: 4, v2: 5 },
-        { v0: 1, v1: 5, v2: 6 }, { v0: 1, v1: 6, v2: 2 }, { v0: 0, v1: 3, v2: 7 }, { v0: 0, v1: 7, v2: 4 },
-    ];
-    return { vertices: v, triangles };
+function addCube(sb, center, size, material = Materials.WHITE) {
+  const [cx, cy, cz] = center;
+  const [sx, sy, sz] = Array.isArray(size) ? size : [size, size, size];
+  const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
+  const x0 = cx - hx, x1 = cx + hx;
+  const y0 = cy - hy, y1 = cy + hy;
+  const z0 = cz - hz, z1 = cz + hz;
+  const v000 = [x0, y0, z0], v100 = [x1, y0, z0], v110 = [x1, y1, z0], v010 = [x0, y1, z0];
+  const v001 = [x0, y0, z1], v101 = [x1, y0, z1], v111 = [x1, y1, z1], v011 = [x0, y1, z1];
+  sb.addQuad(v001, v101, v111, v011, material);
+  sb.addQuad(v100, v000, v010, v110, material);
+  sb.addQuad(v101, v100, v110, v111, material);
+  sb.addQuad(v000, v001, v011, v010, material);
+  sb.addQuad(v010, v011, v111, v110, material);
+  sb.addQuad(v000, v100, v101, v001, material);
+  return sb;
 }
 
 export function createScene() {
-    const cubeGeometry = generateCubeGeometry();
-    return [
-        {
-            name: 'center_sphere',
-            type: 'sphere',
-            position: vec3(0, 0, 0),
-            geometry: { radius: 1.0 },
-            material: { shadingType: 'emissive', color: vec3(1.0, 1.0, 0.8) },
-            isLight: true,
-            animation: (time, obj) => {
-                obj.position = vec3(0, 0, Math.sin(time * 0.5) * 2.0);
-            }
-        },
-        {
-            name: 'left_cube',
-            type: 'mesh',
-            position: vec3(-1.8, 0, 0),
-            geometry: cubeGeometry,
-            transformedVertices: cubeGeometry.vertices,
-            animation: (time, obj) => {
-                const rotMatrix = rotationMatrixY(time);
-                obj.transformedVertices = obj.geometry.vertices.map(v => add(transformPoint(v, rotMatrix), obj.position));
-            }
-        },
-        {
-            name: 'right_cube',
-            type: 'mesh',
-            position: vec3(1.8, 0, 0),
-            geometry: cubeGeometry,
-            transformedVertices: cubeGeometry.vertices,
-            animation: (time, obj) => {
-                const rotMatrix = rotationMatrixX(time * 0.7);
-                obj.transformedVertices = obj.geometry.vertices.map(v => add(transformPoint(v, rotMatrix), obj.position));
-            }
-        },
-        {
-            name: 'floor',
-            type: 'sphere',
-            position: vec3(0, -201, 0),
-            geometry: { radius: 200 },
-            material: { shadingType: 'diffuse', albedo: vec3(0.8, 0.8, 1.0) }
-        }
-    ];
+  const sb = createSceneBuilder();
+
+  // Camera pose (NEW) — from your log:
+  // pos=(-1.719, 0.499, 6.879), yaw=-1.025, pitch=-0.325
+  sb.setCameraPose([-2.023, 2.500, 7.376], { yaw: -1., pitch: -0.4 });
+
+  // Infinite ground
+  sb.addPlane([0, 1, 0], 0.0, Materials.WHITE);
+
+  // Spheres
+  sb.addSphere([-2.0, 1.0,  3.2], 1.0,  Materials.WHITE);
+  sb.addSphere([ 0.6, 0.75, 2.1], 0.75, Materials.GLASS);
+  sb.addSphere([ 2.4, 1.25, 4.2], 1.25, Materials.RED);
+
+  // Cubes
+  addCube(sb, [-3.2, 0.50, 5.0],  1.0,               Materials.WHITE);
+  addCube(sb, [ 1.8, 0.60, 5.4], [1.2, 1.2, 1.2],    Materials.GREEN);
+
+  // Static emissives
+  sb.addSphere([3.6, 0.5, 3.0], 0.30, Materials.LIGHT);
+  addCube(sb, [0.0, 0.25, 1.2], 0.50, Materials.LIGHT);
+
+  // Lights
+  sb.setLight([0.0, 4.5, 2.5], 0.75, { auto: false });                  // area light
+  sb.setEnvLight([0.20, 0.30, 0.50], 0.7);                              // sky env
+  sb.setDirLight([0.25, -1.0, 0.15], [1.0, 0.95, 0.90], 1.8);           // sun
+
+  return sb.toObject();
 }
