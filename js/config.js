@@ -12,6 +12,7 @@ export const config = {
   USE_GRAYSCALE: false, // true for grayscale text, false for color
 
   ASCII_RAMP: " .:-=+*#%@",
+  ASCII_RAMP: "@#+-.",
   ASCII_RAMP: "@%#*+=-:. ",
   //ASCII_RAMP: "@&#+=~-;:\",.",
   //ASCII_RAMP: " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
@@ -36,38 +37,18 @@ export const config = {
 
   // ---- Path tracer core params ----
   PATH_TRACER: {
-    SAMPLES_PER_BATCH: 64,
+    SAMPLES_PER_BATCH: 16,
     MAX_BOUNCES: 4,
     LIGHT_COLOR: [16.86, 10.76, 8.2], // stable default "area light" color
     GAMMA_EXP: 1.0,                   // *** no gamma correction ***
-    ANIMATE_NOISE: false,
     // PIXEL_ASPECT is filled at runtime from measured char size
-  },
-
-  // ---- Temporal accumulation (history filter) ----
-  TEMPORAL: {
-    ENABLED: false,
-    USE_GAUSSIAN_CLAMP: true,
-
-    // Small kernel + modest sigma: clamps fireflies without blurring details
-    KERNEL_SIZE: 9,   // odd
-    SIGMA: 2.25,
-
-    // Heavier history weight for stability; still responds to changes
-    DIFF_SCALE: 0.12, // lower → more history kept
-    DIFF_POWER: 1.0,  // linear sensitivity
-    MIN_BLEND: 0.04,  // base blend of new frame into history
-
-    RESET_ON_CAMERA_CHANGE: true,
-    POS_EPS: 1e-1,
-    ANG_EPS: 1e-1,
   },
 
   // ---- Adaptive sampling (per-pixel) ----
   ADAPTIVE: {
     ENABLED: true,
     MAX_TOLERANCE: 0.10,
-    MAX_SAMPLES: 512, // reasonable cap; temporal smoothing handles the rest
+    MAX_SAMPLES: 128, // reasonable cap; temporal smoothing handles the rest
     RESET_ON_CAMERA_CHANGE: true,
   },
 };

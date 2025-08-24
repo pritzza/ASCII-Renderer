@@ -1,75 +1,87 @@
 // js/main.js
+// Overlay sits above the canvas. RMB behavior:
+// - Right-click highlighted text: DOM context menu (no lock)
+// - Right-click non-highlighted text: enter pointer lock
+// - While locked, any right-click: exit pointer lock
+// Overlay DOM text updates incrementally (1 row per frame by default).
+
 import { config } from './config.js';
 import { createBuffer } from './utils.js';
 import { camera, keysPressed, updateCamera } from './camera.js';
 import { createScene } from './scene.js';
-import { renderUI, compositeAndQuantize } from './renderer.js';
+import { renderUI } from './renderer.js';
 import { renderScene } from './gpu_renderer.js';
-import { setBackend, listBackends, getBackend, setScene } from './gpu_renderer.js';
+import { setBackend, setScene } from './gpu_renderer.js';
+import { AsciiPass } from './ascii_pass.js';
+import { TextOverlay } from './text_overlay.js';
 
 const state = {
-  // grid/viewport
+  // grid/viewport sizing
   charWidth: 0, charHeight: 0,
   cols: config.VIRTUAL_GRID_WIDTH,
   rows: config.VIRTUAL_GRID_HEIGHT,
-  visibleCols: 0, visibleRows: 0,
-  gridOffsetX: 0, gridOffsetY: 0,
-  viewportEl: null, scrollerEl: null, windowEl: null,
 
-  // CPU buffers
-  framebuffer: null,       // compatibility pointer (points at displayBuffer)
-  uiBuffer: null,
-  dataBuffer_chars: null,
-  dataBuffer_colors: null,
-
-  // DOM helpers
-  nodePool: [],
-  colorClassMap: new Map(),
-
-  // loop/time
-  animationId: null,
-  lastUpdateTime: 0,
-  time: 0,
+  // DOM refs
+  viewportEl: null,
+  outputCanvas: null,
+  previewCanvas: null, previewCtx: null, previewImageData: null,
 
   // scene & UI
   scene: [],
   uiEffects: [],
-  isScrolling: false,
-  scrollTimeout: null,
 
-  // pointer-lock / mouselook
+  // input/loop
   lookActive: false,
+  animationId: null,
+  lastUpdateTime: 0,
+  time: 0,
 
-  // preview canvas
-  previewCanvas: null,
-  previewCtx: null,
-  previewImageData: null,
-
-  // --- GPU/CPU double-buffering for one-frame latency ---
-  fbA: null,
-  fbB: null,
-  displayBuffer: null, // last finished frame (CPU)
-  workBuffer: null,    // where GPU will write next result (CPU)
+  // CPU double buffers
+  fbA: null, fbB: null,
+  displayBuffer: null,
+  workBuffer: null,
+  framebuffer: null,
   gpuInFlight: false,
   frameReady: false,
 
-  // --- Dirty-tracking for minimal DOM updates (Step 1) ---
-  _lastChars: null,
-  _lastColors: null,
-  _dirty: [],
+  // UI buffer
+  uiBuffer: null,
+
+  // ascii pass
+  ascii: null,
+  debug: false,
+
+  // overlay
+  overlay: null,
+
+  // overlay update cadence
+  overlayRowCursor: 0,
+  overlayFrameCount: 0,
+  // 'row' = update 1 row each frame; 'interval' = refresh all rows every N frames; 'off' disables
+  overlayUpdateMode: 'row',
+  overlayIntervalN: 60,
 };
 
-// --- add near the top ---
 function hasDebugFlag() {
-    const p = new URLSearchParams(location.search);
-    if (!p.has('debug')) return false;
-    const v = (p.get('debug') || '').toLowerCase();
-    return v === '' || v === '1' || v === 'true' || v === 'yes';
-  }  
+  const p = new URLSearchParams(location.search);
+  if (!p.has('debug')) return false;
+  const v = (p.get('debug') || '').toLowerCase();
+  return v === '' || v === '1' || v === 'true' || v === 'yes';
+}
 
-// ---------------- camera input glue ----------------
+/* --- snap the canvas to device pixels (with flip) --- */
+function snapToDevicePixels(el) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = el.getBoundingClientRect();
+  const fx = (r.left * dpr) - Math.round(r.left * dpr);
+  const fy = (r.top  * dpr) - Math.round(r.top  * dpr);
+  const tx = -fx / dpr;
+  const ty = -fy / dpr;
+  el.style.transform = `translate(${tx}px, ${ty}px) scaleY(-1)`;
+}
+
+/* ----------------------------- Input setup ----------------------------- */
 function attachInput() {
-  // Keys (prevent page scroll on arrows/space)
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
@@ -78,334 +90,264 @@ function attachInput() {
   window.addEventListener('keyup', (e) => keysPressed.delete(e.key.toLowerCase()));
   window.addEventListener('blur', () => keysPressed.clear());
 
-  // Right/middle click -> pointer lock for mouse look
+  // Only MIDDLE button directly requests pointer lock here.
+  // RMB is fully handled by the overlay (so DOM menu can appear when needed).
   state.viewportEl.addEventListener('mousedown', (e) => {
-    if (e.button === 1 || e.button === 2) {
+    if (e.button === 1) {
       e.preventDefault();
       state.viewportEl.requestPointerLock?.();
     }
   });
-  // Don’t show context menu (we use right-click)
-  state.viewportEl.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  // Pointer lock state changes
+  // DO NOT blanket-prevent context menus here; overlay decides when to allow it.
+
   document.addEventListener('pointerlockchange', () => {
     state.lookActive = (document.pointerLockElement === state.viewportEl);
   });
 
-  // Mouse look while locked
   document.addEventListener('mousemove', (e) => {
     if (!state.lookActive) return;
-    const sens = camera.sensitivity * 0.002; // tune factor
+    const sens = camera.sensitivity * 0.002;
     camera.yaw   += e.movementX * sens;
     camera.pitch -= e.movementY * sens;
-
-    // clamp pitch to avoid flip
     const lim = Math.PI * 0.5 - 0.1;
     if (camera.pitch >  lim) camera.pitch =  lim;
     if (camera.pitch < -lim) camera.pitch = -lim;
-
-    // wrap yaw for numerical stability
     if (camera.yaw >  Math.PI) camera.yaw -= Math.PI * 2;
     if (camera.yaw < -Math.PI) camera.yaw += Math.PI * 2;
   });
 
-  // Optional: mouse wheel = speed tweak
   state.viewportEl.addEventListener('wheel', (e) => {
-    if (!e.ctrlKey) return; // hold Ctrl to modify speed
+    if (!e.ctrlKey) return;
     e.preventDefault();
     const s = Math.max(0.25, Math.min(20, camera.speed * (e.deltaY < 0 ? 1.1 : 0.9)));
     camera.speed = s;
   }, { passive: false });
+
+  // MINIMAL FIX: while in pointer lock, a right-click exits lock
+  document.addEventListener('mousedown', (e) => {
+    if (e.button === 2 && document.pointerLockElement === state.viewportEl) {
+      e.preventDefault();           // avoid context menu on exit
+      document.exitPointerLock?.();
+    }
+  }, true); // capture so we run before anything else
+
 }
 
-// ---------------- app setup ----------------
-function packColor(r, g, b) { return (r << 16) | (g << 8) | b; }
+/* ------------------------------ App setup ------------------------------ */
+function measureCharSize() {
+  const el = document.getElementById('measure');
+  const rect = el.getBoundingClientRect();
+  state.charWidth  = Math.max(0.5, rect.width);
+  state.charHeight = Math.max(0.5, rect.height);
+}
 
 function init() {
-  
-  // --- Choose backend from URL or config ---
-  // usage: ?backend=raster  or  ?backend=pathtrace  (default)
   const params = new URLSearchParams(location.search);
   const requested = (params.get('backend') || params.get('renderer') || (config.DEFAULT_BACKEND || 'pathtrace')).toLowerCase();
-  try {
-    if (typeof setBackend === 'function') setBackend(requested);
-  } catch (err) {
+  try { if (typeof setBackend === 'function') setBackend(requested); }
+  catch (err) {
     console.warn(`[init] setBackend("${requested}") failed; falling back to "pathtrace"`, err);
     try { setBackend('pt'); } catch {}
   }
 
-  // --- Debug preview toggle (URL: ?debug or ?debug=1/true/yes) ---
   state.debug = hasDebugFlag();
-  
-  // DO NOT REMOVE
-  //setBackend('pt'); // path tracer
-  //setBackend('rt'); // ray tracer
-  //setBackend('r');  // rasterizer
-  
-  // --- DOM refs ---
-  state.viewportEl = document.getElementById('grid-viewport');
-  state.scrollerEl = document.getElementById('grid-scroller');
-  state.windowEl   = document.getElementById('grid-window');
 
-  // --- Preview canvas (create only when debug is ON) ---
+  state.viewportEl = document.getElementById('grid-viewport');
+
+  // Create / attach our canvas if not present
+  let out = document.getElementById('ascii-canvas');
+  if (!out) {
+    out = document.createElement('canvas');
+    out.id = 'ascii-canvas';
+    out.style.display = 'block';
+    out.style.removeProperty('width');
+    out.style.removeProperty('height');
+    out.style.imageRendering = 'pixelated';
+    state.viewportEl.innerHTML = '';
+    state.viewportEl.appendChild(out);
+  }
+  state.outputCanvas = out;
+
+  // Ensure canvas is positioned and underlayed
+  state.outputCanvas.style.position = 'absolute';
+  state.outputCanvas.style.top = '0';
+  state.outputCanvas.style.left = '0';
+  state.outputCanvas.style.zIndex = '1';
+
   const previewWrap = document.getElementById('preview-wrap');
   if (previewWrap) previewWrap.style.display = state.debug ? 'block' : 'none';
   if (state.debug) {
     state.previewCanvas = document.getElementById('preview');
     state.previewCtx    = state.previewCanvas.getContext('2d', { willReadFrequently: false });
-    state.previewCanvas.width  = state.cols;
-    state.previewCanvas.height = state.rows;
-    state.previewImageData = new ImageData(state.cols, state.rows);
   } else {
-    state.previewCanvas = null;
-    state.previewCtx = null;
-    state.previewImageData = null;
+    state.previewCanvas = null; state.previewCtx = null;
   }
 
-  // --- Scene (programmatic) -> GPU ---
-  state.scene = createScene();
+  // Measure cell size and propagate aspect
+  measureCharSize();
+  config.PATH_TRACER.PIXEL_ASPECT = state.charWidth / state.charHeight;
 
-  // Sync camera from scene (if scene provides a camera)
+  // Scene and camera
+  state.scene = createScene();
   if (state.scene?.camera?.pos) {
     const c = state.scene.camera;
     camera.pos.x = c.pos[0]; camera.pos.y = c.pos[1]; camera.pos.z = c.pos[2];
     if (Number.isFinite(c.yaw))   camera.yaw   = c.yaw;
     if (Number.isFinite(c.pitch)) camera.pitch = c.pitch;
   }
-
-  // Forward unified scene to the ACTIVE backend (now that backend is set)
   if (typeof setScene === 'function') setScene(state.scene);
 
-  // --- Cell metrics & pixel aspect for the tracer ---
-  measureCharSize();
-  // Make camera rays match the non-square ASCII cell aspect (w/h)
-  config.PATH_TRACER.PIXEL_ASPECT = state.charWidth / state.charHeight;
+  // CPU buffers
+  const n = state.cols * state.rows * 4;
+  state.fbA = new Uint8ClampedArray(n);
+  state.fbB = new Uint8ClampedArray(n);
+  state.displayBuffer = state.fbA;
+  state.workBuffer    = state.fbB;
+  state.framebuffer   = state.displayBuffer;
 
-  // --- CPU side buffers for ASCII compositing ---
-  const n = state.cols * state.rows;
-  state.dataBuffer_chars  = new Uint32Array(n);
-  state.dataBuffer_colors = new Uint32Array(n);
-
-  // Dirty-tracking caches
-  state._lastChars  = new Uint32Array(n);
-  state._lastColors = new Uint32Array(n);
-  state._dirty = [];
-
-  // --- CSS color classes (reduced palette + containment) ---
-  createStaticStylesheet(state);
-
-  // --- Virtual scroller sizing ---
-  state.scrollerEl.style.width  = `${state.cols * state.charWidth}px`;
-  state.scrollerEl.style.height = `${state.rows * state.charHeight}px`;
-
-  const buffer = 2;
-  state.visibleCols = Math.ceil(state.viewportEl.clientWidth  / state.charWidth)  + buffer;
-  state.visibleRows = Math.ceil(state.viewportEl.clientHeight / state.charHeight) + buffer;
-
-  state.windowEl.style.gridTemplateColumns = `repeat(${state.visibleCols}, ${state.charWidth}px)`;
-  state.windowEl.style.gridTemplateRows    = `repeat(${state.visibleRows}, ${state.charHeight}px)`;
-
-  // --- Create visible DOM cells (pooled) ---
-  state.nodePool.length = 0;
-  for (let i = 0; i < state.visibleCols * state.visibleRows; i++) {
-    const cell = document.createElement('div');
-    cell.className = 'cell';
-    state.windowEl.appendChild(cell);
-    state.nodePool.push(cell);
-  }
-
-  // --- Double-buffered CPU targets (one-frame latency with GPU) ---
-  const byteCount = n * 4; // RGBA
-  state.fbA = new Uint8ClampedArray(byteCount);
-  state.fbB = new Uint8ClampedArray(byteCount);
-  state.displayBuffer = state.fbA; // last finished frame (CPU)
-  state.workBuffer    = state.fbB; // where GPU writes next result (CPU)
-  state.framebuffer   = state.displayBuffer; // compatibility pointer
-
-  // --- UI buffer (ASCII overlay) ---
+  // UI buffer
   state.uiBuffer = createBuffer(state.cols, state.rows, null);
 
-  // --- Input & events ---
-  attachInput();
-  window.addEventListener('resize', () => window.location.reload());
-  state.viewportEl.addEventListener('scroll', handleScroll, { passive: true });
-  state.windowEl.addEventListener('click', handleClick);
+  // Initialize ASCII GPU pass
+  state.ascii = new AsciiPass(state.outputCanvas, {
+    grayscaleText: !!config.USE_GRAYSCALE,
+    alphaGamma: 1.32,
+    alphaKnee: 0.3,
+    alphaBiasPre: 0.1,
+    alphaCutoff: 0.4,
+    alphaBiasPost: 0.05,
+    transparentBackground: true
+  });
+  state.ascii.setCellSize(state.charWidth, state.charHeight);
 
-  // Initial layout & timebase
-  handleScroll();
+  // Snap canvas to device pixels
+  snapToDevicePixels(state.outputCanvas);
+
+  // Input
+  attachInput();
+
+  // Overlay (above canvas) — RMB logic handled inside TextOverlay
+  state.overlay = new TextOverlay({
+    mountEl: state.viewportEl,
+    canvasEl: state.outputCanvas,
+    pointerLockEl: state.viewportEl,
+    getGrid: () => ({ cols: state.cols, rows: state.rows, charWidth: state.charWidth, charHeight: state.charHeight }),
+    getDisplayBuffer: () => state.displayBuffer,
+    ramp: config.ASCII_RAMP,
+    frozen: false,
+    onMouseDown: (info, e) => {
+      // Forward to game logic:
+      if (e.button === 0) handleGameClickAt(info.x, info.y, 0);
+      if (e.button === 2) {
+        // Only forward RMB to game if NOT on selection (onSelection => pure DOM menu)
+        if (!info.onSelection) handleGameClickAt(info.x, info.y, 2);
+      }
+    },
+    onClick: () => {},
+    onContextMenu: () => {}, // overlay decides whether to allow the menu
+  }).init();
+
+  window.addEventListener('resize', () => {
+    measureCharSize();
+    state.ascii.setCellSize(state.charWidth, state.charHeight);
+    snapToDevicePixels(state.outputCanvas);
+    state.overlay.sizeToGrid();
+    state.overlay.refreshAllRows();
+  });
+
+  state.viewportEl.addEventListener('scroll', () => {
+    snapToDevicePixels(state.outputCanvas);
+    state.overlay.alignToDevicePixels();
+  }, { passive: true });
+
+  // Timebase
   state.lastUpdateTime = performance.now();
   state.time = state.lastUpdateTime;
 
-  // --- Kick the first GPU job; we'll display it next rAF ---
+  // Kick first GPU job
   kickGPU(performance.now() * 0.001);
 
-  // --- Start the pipelined loop (DOM draws frame N while GPU renders N+1) ---
+  // Loop
   animationLoop();
 }
 
-// ---------------- UI / DOM ----------------
-function createStaticStylesheet() {
-  const numColorBands = config.ASCII_RAMP.length;
-  if (numColorBands === 0) return;
+function updateDomOverlay() {
+  if (!state.overlay) return;
+  state.overlayFrameCount++;
 
-  const styleEl = document.createElement('style');
-  let styleContent = '';
-  let classCounter = 0;
+  switch (state.overlayUpdateMode) {
+    case 'off':
+      return;
 
-  for (let rStep = 0; rStep < numColorBands; rStep++) {
-    const r = (numColorBands === 1) ? 255 : Math.round((rStep / (numColorBands - 1)) * 255);
-    for (let gStep = 0; gStep < numColorBands; gStep++) {
-      const g = (numColorBands === 1) ? 255 : Math.round((gStep / (numColorBands - 1)) * 255);
-      for (let bStep = 0; bStep < numColorBands; bStep++) {
-        const b = (numColorBands === 1) ? 255 : Math.round((bStep / (numColorBands - 1)) * 255);
-        const packedColor = packColor(r, g, b);
-        const className = `c${classCounter++}`;
-        styleContent += `.${className}{color:rgb(${r},${g},${b});}`;
-        state.colorClassMap.set(packedColor, className);
-      }
+    case 'row': {
+      // cheapest: mutate one DOM row per frame
+      state.overlay.refreshRow(state.overlayRowCursor);
+      state.overlayRowCursor = (state.overlayRowCursor + 1) % state.rows;
+      return;
     }
-  }
 
-  const blackPacked = packColor(0, 0, 0);
-  if (!state.colorClassMap.has(blackPacked)) {
-    const className = `c${classCounter++}`;
-    styleContent += `.${className}{color:#000;}`;
-    state.colorClassMap.set(blackPacked, className);
-  }
-
-  styleEl.textContent = styleContent;
-  document.head.appendChild(styleEl);
-}
-
-function measureCharSize() {
-  const measureEl = document.getElementById('measure');
-  const rect = measureEl.getBoundingClientRect();
-  state.charWidth = rect.width;
-  state.charHeight = rect.height;
-}
-
-function handleClick(e) {
-  // preserve your ripple UI on left click
-  if (e.button !== 0) return;
-  const virtualX = state.gridOffsetX + Math.floor(e.offsetX / state.charWidth);
-  const virtualY = state.gridOffsetY + Math.floor(e.offsetY / state.charHeight);
-  if (virtualY < state.rows && virtualX < state.cols) {
-    state.uiEffects.push({ type: 'ripple', center: { x: virtualX, y: virtualY }, startTime: performance.now() });
-  }
-}
-
-function handleScroll() {
-  state.isScrolling = true;
-  clearTimeout(state.scrollTimeout);
-  state.scrollTimeout = setTimeout(() => { state.isScrolling = false; }, 150);
-
-  const newGridOffsetX = Math.floor(state.viewportEl.scrollLeft / state.charWidth);
-  const newGridOffsetY = Math.floor(state.viewportEl.scrollTop  / state.charHeight);
-
-  if (newGridOffsetX !== state.gridOffsetX || newGridOffsetY !== state.gridOffsetY) {
-    state.gridOffsetX = newGridOffsetX;
-    state.gridOffsetY = newGridOffsetY;
-    state.windowEl.style.transform = `translate(${newGridOffsetX * state.charWidth}px, ${newGridOffsetY * state.charHeight}px)`;
-    updateDOM(true); // full redraw on scroll (kept for correctness)
-  }
-}
-
-// Full redraw (kept exactly as before for non-regression on force cases)
-function updateDOM(forceRedraw = false) {
-  for (let y = 0; y < state.visibleRows; y++) {
-    for (let x = 0; x < state.visibleCols; x++) {
-      const nodeIndex = y * state.visibleCols + x;
-      const node = state.nodePool[nodeIndex];
-      const virtualX = x + state.gridOffsetX;
-      const virtualY = y + state.gridOffsetY;
-
-      if (virtualX >= state.cols || virtualY >= state.rows) {
-        if (node.textContent !== '') node.textContent = '';
-        continue;
+    case 'interval': {
+      // full refresh every N frames
+      if (state.overlayFrameCount % Math.max(1, state.overlayIntervalN) === 0) {
+        state.overlay.refreshAllRows();
       }
-
-      const dataIndex  = virtualY * state.cols + virtualX;
-      const charCode   = state.dataBuffer_chars[dataIndex];
-      const packedColor= state.dataBuffer_colors[dataIndex];
-
-      if (forceRedraw || node._lastCharCode !== charCode) {
-        node.textContent = String.fromCharCode(charCode);
-        node._lastCharCode = charCode;
-      }
-
-      const colorClass = state.colorClassMap.get(packedColor);
-      if (forceRedraw || node._lastColorClass !== colorClass) {
-        node.className = 'cell ' + colorClass;
-        node._lastColorClass = colorClass;
-      }
+      return;
     }
   }
 }
 
-// --- NEW: Dirty update version (only touches changed & visible cells)
-function updateDOMDirty() {
-  const dirty = state._dirty;
-  if (!dirty || dirty.length === 0) return;
+/* ------------------------ UI overlay into framebuffer ------------------------ */
+function applyUIToFrameRGBA() {
+  const { cols, rows, uiBuffer, displayBuffer } = state;
+  if (!uiBuffer || !displayBuffer) return;
+  for (let y = 0; y < rows; y++) {
+    const row = uiBuffer[y];
+    for (let x = 0; x < cols; x++) {
+      if (row[x] == null) continue;
+      const i = (y * cols + x) * 4;
 
-  const { visibleCols, visibleRows, gridOffsetX, gridOffsetY, cols } = state;
+      // Draw UI as black (same as before)...
+      displayBuffer[i + 0] = 0;
+      displayBuffer[i + 1] = 0;
+      displayBuffer[i + 2] = 0;
 
-  for (let k = 0; k < dirty.length; k++) {
-    const i = dirty[k];
-
-    const vx = i % cols;
-    const vy = (i / cols) | 0;
-
-    // Only update if it's on screen
-    const rx = vx - gridOffsetX;
-    const ry = vy - gridOffsetY;
-    if (rx < 0 || ry < 0 || rx >= visibleCols || ry >= visibleRows) continue;
-
-    const nodeIndex = ry * visibleCols + rx;
-    const node = state.nodePool[nodeIndex];
-
-    const ch = state.dataBuffer_chars[i];
-    const packed = state.dataBuffer_colors[i];
-
-    if (node._lastCharCode !== ch) {
-      // Use a persistent text node to avoid re-parsing HTML
-      if (!node._text) node._text = node.firstChild || node.appendChild(document.createTextNode(''));
-      node._text.data = String.fromCharCode(ch);
-      node._lastCharCode = ch;
-    }
-
-    const cls = state.colorClassMap.get(packed);
-    if (node._lastColorClass !== cls) {
-      node.className = 'cell ' + cls;
-      node._lastColorClass = cls;
+      // Encode ASCII override directly: A = ASCII code (>=2 means “override”)
+      const chCode = row[x].charCodeAt(0) & 0xFF;
+      displayBuffer[i + 3] = chCode; // reserve 0/1 as “no override”
     }
   }
-
-  // clear for next frame
-  dirty.length = 0;
 }
 
-// ---------------- GPU kick (one-frame-ahead) ----------------
+/* ------------------------------ GPU dispatch ----------------------------- */
 function kickGPU(timeSec) {
   if (state.gpuInFlight) return;
   state.gpuInFlight = true;
 
-  // Yield to let the browser paint, then start the next GPU job.
   const defer = window.requestIdleCallback || ((fn) => setTimeout(fn, 0));
   defer(() => {
-    // GPU path trace into the *work* CPU buffer (one-frame ahead)
     renderScene(timeSec, state.workBuffer, state);
-
-    // Mark complete; we will publish in the next rAF
     state.frameReady = true;
     state.gpuInFlight = false;
-
-    // Rotate buffers so we never overwrite the one we just finished
     state.workBuffer = (state.workBuffer === state.fbA) ? state.fbB : state.fbA;
   });
 }
 
-// ---------------- main loop (pipelined) ----------------
+/* ------------------------------ Game clicks ------------------------------ */
+function handleGameClickAt(virtualX, virtualY, button) {
+  if (button === 0) {
+    state.uiEffects.push({
+      type: 'ripple',
+      center: { x: virtualX, y: virtualY },
+      startTime: performance.now()
+    });
+  }
+  if (button === 2) {
+    // hook your RMB logic if any (placing markers, opening radial menus, etc.)
+  }
+}
+
+/* --------------------------------- Loop ---------------------------------- */
 function animationLoop(currentTime) {
   state.animationId = requestAnimationFrame(animationLoop);
 
@@ -418,45 +360,32 @@ function animationLoop(currentTime) {
   const deltaTime = elapsed / 1000;
   const fps = 1 / Math.max(deltaTime, 1e-6);
 
-  // 1) Update camera from input (WASD + arrows + mouse look)
   updateCamera(deltaTime);
 
-  // 2) If the GPU finished last frame, publish it now (display frame N)
   if (state.frameReady) {
     state.frameReady = false;
-
-    // The buffer that was just filled is the opposite of workBuffer
     state.displayBuffer = (state.workBuffer === state.fbA) ? state.fbB : state.fbA;
+    state.framebuffer   = state.displayBuffer;
 
-    // Preview canvas
-    if (state.debug && state.previewCtx) {
-        state.previewImageData.data.set(state.displayBuffer);
-        state.previewCtx.putImageData(state.previewImageData, 0, 0);
-    }      
-
-    // Compatibility pointer for downstream pipeline
-    state.framebuffer = state.displayBuffer;
-
-    // UI overlay + ASCII composite
-    renderUI(Math.round(fps), state);
-    compositeAndQuantize(state); // <- fills state.dataBuffer_* AND pushes state._dirty indices (see note below)
-
-    // Cull finished UI effects
-    state.uiEffects = state.uiEffects.filter(effect => {
-      const age = currentTime - effect.startTime;
-      const radius = age * config.RIPPLE_SPEED;
-      return radius < config.MAX_RIPPLE_RADIUS;
-    });
-
-    // Dirty-only DOM update unless we're scrolling
-    if (!state.isScrolling) {
-      updateDOMDirty();
-    } else {
-      // during active scroll we rely on the forced redraw in handleScroll()
+    if (state.debug && state.previewCtx && state.previewCanvas) {
+      if (!state.previewImageData ||
+          state.previewImageData.width  !== state.cols ||
+          state.previewImageData.height !== state.rows) {
+        state.previewImageData = new ImageData(state.cols, state.rows);
+      }
+      state.previewImageData.data.set(state.displayBuffer);
+      state.previewCtx.putImageData(state.previewImageData, 0, 0);
     }
+
+    renderUI(Math.round(fps), state);
+    applyUIToFrameRGBA();
+
+    state.ascii.drawFromBuffer(state.displayBuffer, state.cols, state.rows);
+
+    // Update the invisible DOM text on your chosen cadence
+    updateDomOverlay();
   }
 
-  // 3) Queue the next GPU render (produce frame N+1)
   kickGPU(currentTime * 0.001);
 }
 

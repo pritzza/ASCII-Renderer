@@ -21,7 +21,7 @@ export function buildTracerSources(PT) {
 #define MAX_PLANES  ${MAXP}
 #define MAX_TRIS    ${MAXT}
 
-${(PT?.ANIMATE_NOISE ?? true) ? '#define ANIMATENOISE' : ''}
+// (Temporal anti-aliasing removed: no ANIMATENOISE define)
 ${(PT?.DIRECT_LIGHT_SAMPLING ?? true) ? '#define DIRECT_LIGHT_SAMPLING' : ''}
 
 #define LIGHTCOLOR  vec3(${LIGHT[0].toFixed(4)}, ${LIGHT[1].toFixed(4)}, ${LIGHT[2].toFixed(4)})*1.3
@@ -35,9 +35,7 @@ attribute vec2 aPosition;
 void main(){ gl_Position = vec4(aPosition, 0.0, 1.0); }
 `;
 
-  const fs = `
-// --- BEGIN PT FRAGMENT SHADER ---
-#ifdef GL_ES
+  const fs = `#ifdef GL_ES
 precision highp float;
 precision highp int;
 #endif
@@ -52,7 +50,7 @@ uniform float uPitch;
 uniform float uFovY;
 uniform float uGamma; // ABI only; referenced with 0 weight
 
-// ***** SCENE UNIFORMS (RESTORED) *****
+// ***** SCENE UNIFORMS (sizes come from injected #defines) *****
 uniform int   uNumSpheres;
 uniform vec4  uSpheres[MAX_SPHERES];  // xyz=ctr, w=radius
 uniform float uSphereM[MAX_SPHERES];
@@ -66,20 +64,32 @@ uniform vec3  uTriA[MAX_TRIS];
 uniform vec3  uTriB[MAX_TRIS];
 uniform vec3  uTriC[MAX_TRIS];
 uniform float uTriM[MAX_TRIS];
-// *************************************
+// **********************************************
 
 // Light (animated or fixed)
 uniform vec3  uLightCenter;
 uniform float uLightRadius;
 uniform float uLightAuto;
 
-#define eps 1e-3
+// Scene color constants are injected by JS via #define (LIGHTCOLOR, etc.)
 
-// RNG
-float hash1(inout float seed){ return fract(sin(seed += 0.1)*43758.5453123); }
-vec2  hash2(inout float seed){ return fract(sin(vec2(seed+=0.1,seed+=0.1))*vec2(43758.5453123,22578.1459123)); }
+// Robust epsilon
+const float eps = 1e-3;
 
-// Environment: sky/ground gradient
+// ---------------- RNG (deterministic, no UB) ----------------
+float hash1(inout float seed){
+  seed += 0.1;                       // advance exactly once per call
+  return fract(sin(seed)*43758.5453123);
+}
+
+vec2 hash2(inout float seed){
+  seed += 0.1; float s1 = seed;      // first advance
+  seed += 0.1; float s2 = seed;      // second advance
+  vec2 v = sin(vec2(s1, s2)) * vec2(43758.5453123, 22578.1459123);
+  return fract(v);
+}
+
+// ---------------- Environment ----------------
 vec3 environment(vec3 rd){
   float t = clamp(rd.y*0.5+0.5, 0.0, 1.0);
   vec3 sky  = mix(vec3(0.90,0.95,1.00), vec3(0.45,0.65,0.95), pow(t,1.2));
@@ -87,7 +97,7 @@ vec3 environment(vec3 rd){
   return mix(grd*0.35, sky, smoothstep(-0.05, 0.05, rd.y));
 }
 
-// Intersections
+// ---------------- Intersections ----------------
 float iSphere(vec3 ro, vec3 rd, vec4 sph){
   vec3 oc = ro - sph.xyz;
   float b = dot(oc, rd);
@@ -127,7 +137,7 @@ float iTriangle(vec3 ro, vec3 rd, vec3 a, vec3 b, vec3 c, out vec3 n){
   return tt;
 }
 
-// Materials
+// ---------------- Materials ----------------
 vec3 matColor(float m){
   vec3 albedo = vec3(0.,0.95,0.);
   if (m < 3.5) albedo = REDCOLOR;
@@ -139,7 +149,7 @@ vec3 matColor(float m){
 bool matIsSpecular(float m){ return m > 4.5; }
 bool matIsLight(float m){ return m < 0.5; }
 
-// Light sphere
+// ---------------- Light sphere ----------------
 vec4 getLightSphere(float time){
   if (uLightAuto > 0.5) {
     return vec4(
@@ -152,7 +162,7 @@ vec4 getLightSphere(float time){
   return vec4(uLightCenter, uLightRadius);
 }
 
-// Sampling
+// ---------------- Sampling ----------------
 vec3 cosWeightedHemisphere(const vec3 n, inout float seed){
   vec2 r = hash2(seed);
   float phi = 6.28318530718 * r.x;
@@ -169,7 +179,7 @@ vec3 sampleLight(in vec3 ro, inout float seed, vec4 light){
   return light.xyz + light.w * n;
 }
 
-// Scene intersection
+// ---------------- Scene intersection wrappers ----------------
 vec2 intersect(in vec3 ro, in vec3 rd, out vec3 normal, vec4 lightSphere){
   vec2 res = vec2(1e20, -1.0);
   float t; vec3 n;
@@ -205,7 +215,7 @@ bool intersectShadow(in vec3 ro, in vec3 rd, in float dist){
   return false;
 }
 
-// BRDF (diffuse + dielectric w/ Fresnel + TIR)
+// ---------------- BRDF (diffuse + dielectric w/ Fresnel + TIR) ----------------
 vec3 nextDirection(vec3 n, const vec3 rd, float m, inout bool specularBounce, inout float seed){
   specularBounce = false;
   if (!matIsSpecular(m)) return cosWeightedHemisphere(n, seed);
@@ -221,8 +231,8 @@ vec3 nextDirection(vec3 n, const vec3 rd, float m, inout bool specularBounce, in
   return normalize(ref);
 }
 
-// Path tracer (with environment on miss)
-vec3 traceEyePath(in vec3 ro, in vec3 rd, bool useDLS, inout float seed, vec4 lightSphere){
+// ---------------- Path tracer (DLS always on) ----------------
+vec3 traceEyePath(in vec3 ro, in vec3 rd, inout float seed, vec4 lightSphere){
   vec3 Lo = vec3(0.0);
   vec3 T  = vec3(1.0);
   bool specularBounce = true;
@@ -238,36 +248,33 @@ vec3 traceEyePath(in vec3 ro, in vec3 rd, bool useDLS, inout float seed, vec4 li
     vec3 hit = ro + t * rd;
 
     if (matIsLight(mat)) {
-#ifdef DIRECT_LIGHT_SAMPLING
-      if (useDLS) { if (specularBounce) Lo += T * LIGHTCOLOR; }
-      else        { Lo += T * LIGHTCOLOR; }
-#else
-      Lo += T * LIGHTCOLOR;
-#endif
+      // With DLS, count emission only on specular paths to avoid double-count with NEE
+      if (specularBounce) Lo += T * LIGHTCOLOR;
       break;
     }
 
+    // Bounce
     vec3 ndir = nextDirection(n, rd, mat, specularBounce, seed);
     if (!specularBounce || dot(ndir, n) < 0.0) T *= matColor(mat);
 
-#ifdef DIRECT_LIGHT_SAMPLING
-    if (useDLS && !specularBounce && j < EYEPATHLENGTH-1) {
+    // Next-Event Estimation (always on): sample the light on diffuse bounces
+    if (!specularBounce && j < EYEPATHLENGTH-1) {
       vec3  Lpos = sampleLight(hit, seed, lightSphere);
       vec3  Ldir = normalize(Lpos - hit);
       float dist = length(Lpos - hit);
       if (!intersectShadow(hit + n*eps, Ldir, dist)) {
         float cos_a_max = sqrt(1.0 - clamp(lightSphere.w*lightSphere.w /
                           dot(lightSphere.xyz - hit, lightSphere.xyz - hit), 0.0, 1.0));
-        float weight = 2.0 * (1.0 - cos_a_max);
+        float weight = 2.0 * (1.0 - cos_a_max);  // uniform-on-sphere pdf factor
         Lo += T * LIGHTCOLOR * (weight * max(dot(Ldir, n), 0.0));
       }
     }
-#endif
 
     rd = ndir;
     float side = (dot(rd, n) > 0.0) ? 1.0 : -1.0;
     ro = hit + n * side * eps;
 
+    // Russian roulette
     if (j >= 2) {
       float p = clamp(max(T.r, max(T.g, T.b)), 0.05, 0.95);
       if (hash1(seed) > p) break;
@@ -282,17 +289,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
   float aspect = (iResolution.x / iResolution.y) * PIXEL_ASPECT;
   p.x *= aspect;
 
-#ifdef DIRECT_LIGHT_SAMPLING
-  const bool DLS = true;
-#else
-  const bool DLS = false;
-#endif
-
-#ifdef ANIMATENOISE
-  float seed = p.x + p.y * 3.43121412313 + fract(1.12345314312 * iTime);
-#else
+  // Deterministic seed (no time dependence)
   float seed = p.x + p.y * 3.43121412313;
-#endif
 
   // Camera
   vec3 look = vec3(cos(uPitch)*cos(uYaw), sin(uPitch), cos(uPitch)*sin(uYaw));
@@ -311,8 +309,10 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
     rpof.x *= aspect;
     vec3 rd = normalize((p.x+rpof.x)*uu + (p.y+rpof.y)*vv + focal*ww);
 
-    vec3 col = traceEyePath(ro, rd, DLS, seed, lSphere);
+    vec3 col = traceEyePath(ro, rd, seed, lSphere);
     tot += col;
+
+    // Deterministic advance; keeps sequence stable
     seed = mod(seed * 1.1234567893490423, 13.0);
   }
 
@@ -323,7 +323,6 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord){
 }
 
 void main(){ vec4 c; mainImage(c, gl_FragCoord.xy); gl_FragColor = c; }
-// --- END PT FRAGMENT SHADER ---
 `;
 
   return { vs, fs: defines + fs };

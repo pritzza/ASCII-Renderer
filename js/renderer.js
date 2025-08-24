@@ -13,7 +13,7 @@ function packColor(r, g, b) {
 function computeStepsPerChannel(state) {
   if (state._stepsPerChannel) return state._stepsPerChannel;
   const rampLen = Math.max(2, config.ASCII_RAMP.length);
-  const crf = Math.max(1, config.COLOR_REDUCTION_FACTOR | 0);
+  const crf = Math.max(1, (config.COLOR_REDUCTION_FACTOR | 0));
   // Example: ramp 10, CRF 2 => 5 steps per channel (5^3 = 125 classes)
   const steps = Math.max(3, Math.round(rampLen / crf));
   state._stepsPerChannel = steps;
@@ -35,6 +35,7 @@ export function compositeAndQuantize(state) {
     const row = uiBuffer[y];
     for (let x = 0; x < cols; x++) {
       const i = y * cols + x;
+      const p = i * 4;
 
       // UI overlay wins (drawn in black)
       const uiChar = row[x];
@@ -43,6 +44,9 @@ export function compositeAndQuantize(state) {
         const packed = packColor(0, 0, 0);
         dataBuffer_chars[i]  = ch;
         dataBuffer_colors[i] = packed;
+
+        // NEW: also mirror the chosen char into the framebuffer alpha (ASCII code)
+        if (framebuffer) framebuffer[p + 3] = ch & 0xFF;
 
         if (state._dirty && state._lastChars && state._lastColors) {
           if (state._lastChars[i] !== ch || state._lastColors[i] !== packed) {
@@ -54,10 +58,12 @@ export function compositeAndQuantize(state) {
         continue;
       }
 
-      const p = i * 4;
-      const r = framebuffer[p];
+      const r = framebuffer[p + 0];
       const g = framebuffer[p + 1];
       const b = framebuffer[p + 2];
+
+      // NEW: mark this cell as "no override"
+if (framebuffer) framebuffer[p + 3] = 1;
 
       // SIMPLE intensity: average of sRGB bytes (0..255)
       const intensity = (r + g + b) / 3;
@@ -78,6 +84,9 @@ export function compositeAndQuantize(state) {
       }
       const packed = packColor(rq, gq, bq);
       dataBuffer_colors[i] = packed;
+
+      // Note: we do NOT overwrite framebuffer alpha here for normal (quantized) cells.
+      // Alpha==0/1 means "use luminance ramp" in the GPU path. Any UI char sets alpha>1.
 
       // Optional dirty tracking (only if state set these arrays)
       if (state._dirty && state._lastChars && state._lastColors) {
