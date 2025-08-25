@@ -1,7 +1,7 @@
 /**
  * Global configuration settings for the ASCII Ray Tracer.
  */
-let SCREEN_SCALE = 5;
+let SCREEN_SCALE = 4;
 let FONT_HEIGHT_WIDTH_RATIO = 1.5;
 
 export const config = {
