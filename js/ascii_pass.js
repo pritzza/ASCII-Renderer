@@ -1,11 +1,13 @@
 // js/ascii_pass.js
-// GPU ASCII pass that matches DOM rendering:
+// GPU ASCII pass that matches DOM rendering, with optional modal smoothing:
 //  • Colored glyphs (quantized like the DOM path unless USE_GRAYSCALE=true)
 //  • Glyph weight matched via alpha gamma and pixel-center sampling
 //  • Exact sizing: CSS size from #measure (fractional), device size = CSS * DPR
 //  • Atlas baked in DEVICE pixels with the same font as #measure (NEAREST)
+//  • NEW: Modal (majority) smoothing of ramp-quantized glyphs (never touches UI overrides)
 
 import { config } from './config.js';
+import { buildAsciiPassShaderSources } from './ascii_pass_shader.js';
 
 const GL_OPTS = {
   antialias: false,
@@ -14,34 +16,7 @@ const GL_OPTS = {
   desynchronized: true,
 };
 
-/* -------------------------- DOM measurement (ground truth) -------------------------- */
-function readMeasure() {
-  const el = document.getElementById('measure');
-  if (!el) {
-    return {
-      cwCSS: 8, chCSS: 16,
-      family: 'monospace',
-      weight: '400',
-      style: 'normal',
-      stretch: 'normal',
-      sizeCSS: 16,
-    };
-  }
-  const cs = getComputedStyle(el);
-  const rect = el.getBoundingClientRect(); // fractional CSS px allowed
-  return {
-    cwCSS: rect.width,
-    chCSS: rect.height,
-    family: cs.fontFamily || 'monospace',
-    weight: cs.fontWeight || '400',
-    style: cs.fontStyle || 'normal',
-    stretch: cs.fontStretch || 'normal',
-    sizeCSS: parseFloat(cs.fontSize) || 16,
-  };
-}
-
 /* ------------------------------ Glyph atlas (DEVICE px) ------------------------------ */
-// Build a 256-glyph ASCII atlas (index == ASCII code).
 function buildAtlas(gl, cellWDevice, cellHDevice, fontDesc, alphaGamma) {
   const count = 256; // full byte range
   const pad = 2;
@@ -76,7 +51,6 @@ function buildAtlas(gl, cellWDevice, cellHDevice, fontDesc, alphaGamma) {
   const ascent = (mt.actualBoundingBoxAscent ?? cellHDevice * 0.8);
   const descent = (mt.actualBoundingBoxDescent ?? cellHDevice * 0.2);
   const glyphH = ascent + descent;
-  // No rounding: keep subpixel baseline so glyphs aren’t quantized vertically
   const baselineOffsetY = (cellHDevice - glyphH) * 0.5 + ascent;
 
   for (let i = 0; i < count; i++) {
@@ -84,7 +58,6 @@ function buildAtlas(gl, cellWDevice, cellHDevice, fontDesc, alphaGamma) {
     const gy = Math.floor(i / tilesPerRow);
     const ox = gx * tileW + pad;
     const oy = gy * tileH + pad;
-    // No rounding: keep subpixel x/y draw positions
     ctx.fillText(String.fromCharCode(i), ox, oy + baselineOffsetY);
   }
   ctx.restore();
@@ -168,11 +141,15 @@ export class AsciiPass {
     // Config
     this.ramp = String(opts.ramp ?? config.ASCII_RAMP ?? '@%#*+=-:. ');
     this.grayscaleText = !!opts.grayscaleText;
-    // Add these properties (defaults tuned for canvas AA -> DOM look)
-    this.alphaGamma = Number.isFinite(opts.alphaGamma) ? opts.alphaGamma : 1.20; // thins a bit
-    this.alphaBias = Number.isFinite(opts.alphaBias) ? opts.alphaBias : 0.045; // erode a hair
-    // NEW: toggle for discarding transparent glyph texels (transparent background for glyph)
+    this.alphaGamma = Number.isFinite(opts.alphaGamma) ? opts.alphaGamma : 1.20;
+    this.alphaBias = Number.isFinite(opts.alphaBias) ? opts.alphaBias : 0.045;
     this.transparentBackground = opts.transparentBackground !== undefined ? !!opts.transparentBackground : true;
+
+    // Modal smoothing controls (from config)
+    this.modeFilter = !!config.ASCII_MODE_FILTER;
+    const k = Math.max(3, (config.ASCII_MODE_KERNEL | 0) || 3);
+    this.modeRadius = Math.max(1, ((k - 1) / 2) | 0); // 3->1, 5->2, 7->3
+    this.modeThresh = Math.max(1, (config.ASCII_MODE_THRESH | 0) || 5);
 
     // --- Read DOM font metrics from #measure ---
     const measEl = document.getElementById('measure');
@@ -224,7 +201,7 @@ export class AsciiPass {
     this._quad = createQuad(gl);
     this._buildProgram(gl); // compiles with the current ramp length
 
-    // Glyph atlas – now 256-ASCII regardless of ramp
+    // Glyph atlas – 256-ASCII regardless of ramp
     this._atlas = buildAtlas(
       gl,
       this.cellWDevice,
@@ -266,7 +243,6 @@ export class AsciiPass {
   blit(rgbaBuffer, srcCols, srcRows) {
     if (!rgbaBuffer) return;
 
-    // Resize grid/texture if the source size changed
     if ((srcCols | 0) !== (this.cols | 0) || (srcRows | 0) !== (this.rows | 0)) {
       this.setGridSize(srcCols | 0, srcRows | 0);
     }
@@ -274,7 +250,7 @@ export class AsciiPass {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this._srcTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // we flip via CSS, not here
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.cols, this.rows, gl.RGBA, gl.UNSIGNED_BYTE, rgbaBuffer);
   }
 
@@ -312,14 +288,20 @@ export class AsciiPass {
     gl.uniform1f(this._u.padPx, this._atlas.pad || 2);
     gl.uniform1f(this._u.alphaGamma, this.alphaGamma);
     gl.uniform1f(this._u.gray, this.grayscaleText ? 1.0 : 0.0);
-    // NEW: pass the toggle to the shader (0.0 or 1.0)
     gl.uniform1f(this._u.transparentBG, this.transparentBackground ? 1.0 : 0.0);
+
+    // modal smoothing controls
+    gl.uniform1i(this._u.modeOn, this.modeFilter ? 1 : 0);
+    // limit radius to shader's MAX_MODE_RADIUS
+    const MAX_MODE_RADIUS = 3; // must match shader define
+    const r = Math.max(1, Math.min(MAX_MODE_RADIUS, this.modeRadius | 0));
+    gl.uniform1i(this._u.modeRadius, r);
+    gl.uniform1i(this._u.modeThresh, this.modeThresh | 0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
   setCellSize(cwCSS, chCSS) {
-    // Use provided CSS size or read from DOM
     if (!cwCSS || !chCSS) {
       const measEl = document.getElementById('measure');
       if (measEl) {
@@ -343,151 +325,26 @@ export class AsciiPass {
     this._atlas = buildAtlas(gl, this.cellWDevice, this.cellHDevice, { family: this.family }, this.alphaGamma);
   }
 
-  // replace _sizeCanvasToGrid()
   _sizeCanvasToGrid() {
-    // CSS sizes (fractional allowed) — these define *visual* positions
     const cssW = this.cols * this.cwCSS;
     const cssH = this.rows * this.chCSS;
     this.canvas.style.width = `${cssW}px`;
     this.canvas.style.height = `${cssH}px`;
 
-    // Backing store: round ONCE at the total size to avoid per-cell accumulation
     const Wdev = Math.max(1, Math.round(cssW * this.dpr));
     const Hdev = Math.max(1, Math.round(cssH * this.dpr));
     this.canvas.width = Wdev;
     this.canvas.height = Hdev;
 
-    // Device "cell size" used for shader addressing (can be fractional)
-    // These keep GL math exactly aligned to DOM cell edges in CSS space.
     this.cellWDevice = Wdev / this.cols;
     this.cellHDevice = Hdev / this.rows;
 
-    // Atlas tiles are still baked at *integer* device px close to CSS*DPR
     this._atlasCellW = Math.max(1, Math.round(this.cwCSS * this.dpr));
     this._atlasCellH = Math.max(1, Math.round(this.chCSS * this.dpr));
   }
 
-  // replace _buildProgram(gl)
   _buildProgram(gl) {
-    const RAMP_LEN = Math.max(1, this.ramp.length) | 0;
-
-    const vs = `
-      attribute vec2 aPos;
-      varying vec2 vUv;
-      void main(){
-        vUv = aPos * 0.5 + 0.5;
-        gl_Position = vec4(aPos, 0.0, 1.0);
-      }
-    `;// Build a tiny mapper: ramp index -> ASCII code for the character at that index.
-    const _ramp = Array.from(this.ramp);
-    const GLSL_RAMPIDX_TO_ASCII = `
-int asciiFromRampIndex(int idx){
-  ${_ramp.map((ch, i) =>
-      `${i === 0 ? '' : 'else '}if (idx == ${i}) return ${ch.charCodeAt(0)};`
-    ).join('\n  ')}
-  return 32; // fallback to space if out of range
-}
-`;
-    const fs = `
-precision highp float;
-precision highp int;
-
-uniform sampler2D uSrc;    // grid RGBA (A carries override when >=2)
-uniform sampler2D uAtlas;  // 256-ASCII atlas (tile index == ASCII code)
-
-uniform vec2  uGridSize;     // cols, rows
-uniform vec2  uCellPx;       // cellW, cellH (device px)
-uniform vec2  uCanvasPx;     // canvasW, canvasH (device px)
-uniform vec4  uAtlasLayout;  // tileW, tileH, tilesPerRow, ATLAS_COUNT (256)
-uniform float uPadPx;        // padding in atlas
-uniform float uAlphaGamma;   // glyph weight tweak
-uniform float uGray;         // 1 => grayscale/black text
-uniform float uTransparentBG;
-
-// Simple average intensity, to match CPU path: (r+g+b)/3
-float avgRGB(vec3 c){ return (c.r + c.g + c.b) / 3.0; }
-bool texelIsTransparent(float a){ return a <= 0.0; }
-
-// JS-injected mapper: ramp index -> ASCII code
-${GLSL_RAMPIDX_TO_ASCII}
-
-// Ramp length as a compile-time constant for the luminance path
-const int RAMP_LEN = ${this.ramp.length};
-
-void main(){
-  vec2 pix = gl_FragCoord.xy;
-
-  // Cell index
-  vec2 cell = floor(pix / uCellPx);
-  cell = clamp(cell, vec2(0.0), uGridSize - vec2(1.0));
-
-  // Source sample at cell center
-  vec2 srcUV     = (cell + 0.5) / uGridSize;
-  vec4 srcSample = texture2D(uSrc, srcUV);
-  vec3 srcColor  = srcSample.rgb;
-
-  // Decide glyph (atlas index == ASCII code)
-  float aByte = srcSample.a * 255.0 + 0.5;
-  int   aInt  = int(floor(aByte));
-  bool useAsciiOverride = (aInt >= 2 && aInt <= 254);
-
-  int asciiCode;
-  if (useAsciiOverride) {
-    // Draw the exact ASCII glyph from the atlas
-    asciiCode = aInt;
-  } else {
-  // Quantize by simple average (CPU match) with a tiny epsilon to avoid exact-top-bin flips
-  float iF   = avgRGB(srcColor);
-  iF         = clamp(iF, 0.0, 1.0 - 1e-6);                // <- epsilon here
-  float idxF = floor(iF * float(RAMP_LEN - 1) + 0.5);     // round()
-  idxF       = clamp(idxF, 0.0, float(RAMP_LEN - 1));     // WebGL1-safe clamp
-  int   rIdx = int(idxF);
-  asciiCode  = asciiFromRampIndex(rIdx);
-  }
-
-  float glyphIdx = float(asciiCode);
-
-  // Atlas layout
-  float tileW = uAtlasLayout.x;
-  float tileH = uAtlasLayout.y;
-  float tilesPerRow = uAtlasLayout.z;
-  float atlasCount  = uAtlasLayout.w; // should be 256
-
-  float tileX = mod(glyphIdx, tilesPerRow);
-  float tileY = floor(glyphIdx / tilesPerRow);
-
-  // Integer-ish cell bounds → stable texel mapping
-  float canvasW = uCanvasPx.x, canvasH = uCanvasPx.y;
-  float cols = uGridSize.x, rows = uGridSize.y;
-  float cellStartX = floor(cell.x * canvasW / cols);
-  float cellStartY = floor(cell.y * canvasH / rows);
-
-  float pxIdxX = clamp(floor(gl_FragCoord.x - 0.5) - cellStartX, 0.0, 1e9);
-  float pxIdxY = clamp(floor(gl_FragCoord.y - 0.5) - cellStartY, 0.0, 1e9);
-
-  float innerW = tileW - 2.0 * uPadPx;
-  float innerH = tileH - 2.0 * uPadPx;
-
-  float atlasX = clamp(pxIdxX + 0.5, 0.5, max(0.5, innerW - 0.5));
-  float atlasY = clamp(pxIdxY + 0.5, 0.5, max(0.5, innerH - 0.5));
-
-  vec2 atlasPx = vec2(tileX * tileW + uPadPx + atlasX,
-                      tileY * tileH + uPadPx + atlasY);
-  float rowsCount = ceil(atlasCount / tilesPerRow);
-  vec2 atlasDim   = vec2(tilesPerRow * tileW, rowsCount * tileH);
-  vec2 atlasUV    = atlasPx / atlasDim;
-
-  // Coverage → alpha (glyph weight)
-  float cov = texture2D(uAtlas, atlasUV).a;
-  cov = pow(cov, uAlphaGamma);
-  if (uTransparentBG > 0.5 && texelIsTransparent(cov)) { discard; }
-
-  // Tint + composite over white
-  vec3 tint   = mix(srcColor, vec3(0.0), uGray);
-  vec3 outCol = mix(vec3(1.0), tint, cov);
-  gl_FragColor = vec4(outCol, 1.0);
-}
-`;
+    const { vs, fs } = buildAsciiPassShaderSources(this.ramp);
 
     const vso = compile(gl, gl.VERTEX_SHADER, vs);
     const fso = compile(gl, gl.FRAGMENT_SHADER, fs);
@@ -507,6 +364,10 @@ void main(){
       alphaGamma: U('uAlphaGamma'),
       gray: U('uGray'),
       transparentBG: U('uTransparentBG'),
+      // modal smoothing
+      modeOn: U('uModeOn'),
+      modeRadius: U('uModeRadius'),
+      modeThresh: U('uModeThresh'),
     };
   }
 }

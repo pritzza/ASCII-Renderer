@@ -13,9 +13,7 @@ function packColor(r, g, b) {
 function computeStepsPerChannel(state) {
   if (state._stepsPerChannel) return state._stepsPerChannel;
   const rampLen = Math.max(2, config.ASCII_RAMP.length);
-  const crf = Math.max(1, (config.COLOR_REDUCTION_FACTOR | 0));
-  // Example: ramp 10, CRF 2 => 5 steps per channel (5^3 = 125 classes)
-  const steps = Math.max(3, Math.round(rampLen / crf));
+  const steps = Math.max(3, rampLen );
   state._stepsPerChannel = steps;
   return steps;
 }
