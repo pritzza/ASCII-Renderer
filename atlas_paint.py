@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 atlas_paint.py — GUI paint tool for editing a custom "Special RGBA Atlas" file.
 
@@ -7,7 +8,7 @@ FILE FORMAT SPEC (authoritative)
 
 - Container: raw, headerless byte stream
 - Pixel format: RGBA, 8 bits per channel (uint8)
-- Dimensions: must be known out-of-band (e.g. from command line or metadata)
+- Dimensions: must be known out-of-band (e.g. from CLI, metadata)
 - Scan order: row-major, top-to-bottom, left-to-right
 - File length: width * height * 4 bytes
 
@@ -16,7 +17,7 @@ Per-pixel layout:
 
 Alpha semantics (the "special" rules):
     A == 0       → clear cell (transparent). RGB ignored.
-    A == 1       → solid pixel cell. Use RGB as the opaque color.
+    A == 1       → solid pixel cell. Use RGB as opaque color in rendering.
     32 ≤ A ≤ 126 → ASCII glyph cell. A encodes a visible ASCII character,
                    RGB is the glyph’s color.
     other values → invalid/error (non-visible ASCII codes or out-of-range).
@@ -38,71 +39,57 @@ Validity:
 
 Other notes:
     - No compression, no premultiply, no color profile.
-    - Not a PNG; this is raw bytes for direct upload.
-    - Stable for WebGL2: use gl.RGBA8 / gl.UNSIGNED_BYTE and disable
-      premultiply & Y-flip on upload.
+    - Not a PNG; this is raw bytes for direct upload to graphics APIs.
+    - Stable for WebGL2: upload with gl.RGBA8 / gl.UNSIGNED_BYTE and disable
+      premultiply & Y-flip on upload (UNPACK_PREMULTIPLY_ALPHA_WEBGL=false,
+      UNPACK_FLIP_Y_WEBGL=false). Use UNPACK_ALIGNMENT=1 defensively.
 
 ----------------------------------------------------------------------
-USAGE (Python):
+USAGE (Python quick ref):
 ----------------------------------------------------------------------
-
-# Load raw atlas:
 import numpy as np
 buf = np.fromfile("atlas.bin", dtype=np.uint8)
-arr = buf.reshape((height, width, 4))  # HxWx4
+arr = buf.reshape((height, width, 4))  # HxWx4, row-major
 
-# Interpret pixel:
 r,g,b,a = arr[y,x]
 if a==0:        # clear
 elif a==1:      # solid pixel, RGB=(r,g,b)
 elif 32<=a<=126:# glyph chr(a), RGB=(r,g,b)
 else:           # invalid
 
-----------------------------------------------------------------------
-USAGE (WebGL2):
-----------------------------------------------------------------------
-
-# JS: fetch binary, upload with texImage2D
-gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8,
-              width, height, 0,
-              gl.RGBA, gl.UNSIGNED_BYTE, uint8Array);
-
-# GLSL shader (exact alpha recovery):
-int A = int(floor(texel.a * 255.0 + 0.5));
-if (A==0) { ... } else if (A==1) { ... } else if (A>=32 && A<=126) { ... }
-
-----------------------------------------------------------------------
 This script provides a Tkinter GUI for painting/editing this format.
 Left-click in "Pencil" mode → solid pixel (A=1).
 Left-click in "Text" mode   → glyph cell (A=ord(last ASCII key)).
 Right-click                 → clear (A=0).
+"Import ASCII Art…" + "Stamp" mode → place multiline ASCII as glyph cells.
+
 """
 
 import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox, simpledialog
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 VISIBLE_ASCII_MIN = 32
 VISIBLE_ASCII_MAX = 126
 
-DEFAULT_CELL = 24          # canvas pixels per atlas cell
+DEFAULT_CELL = 24
 DEFAULT_W, DEFAULT_H = 32, 16
-CHECK_SCALE = 8            # checker size in canvas pixels
 
 class AtlasModel:
     def __init__(self, w:int, h:int):
         self.w, self.h = w, h
         self.arr = np.zeros((h, w, 4), dtype=np.uint8)  # RGBA
 
+    # ---------- I/O ----------
     def load_raw(self, path:str, w:int, h:int):
+        """
+        Load a raw, headerless RGBA8 buffer. Expect exactly w*h*4 bytes.
+        Stored row-major, top-to-bottom, left-to-right.
+        """
         expected = w*h*4
         data = np.fromfile(path, dtype=np.uint8)
         if data.size != expected:
@@ -112,11 +99,15 @@ class AtlasModel:
         self.arr = data.reshape((h, w, 4))
 
     def save_raw(self, path:str):
+        """
+        Save as raw RGBA8 bytes. Array shape is (H, W, 4), dtype=uint8.
+        """
         self.arr.astype(np.uint8).tofile(path)
 
+    # ---------- Edits ----------
     def set_pixel(self, x:int, y:int, rgb:Tuple[int,int,int]):
         self.arr[y, x, 0:3] = rgb
-        self.arr[y, x, 3] = 1
+        self.arr[y, x, 3] = 1  # A=1 == opaque pixel marker
 
     def set_char(self, x:int, y:int, ch:str, rgb:Tuple[int,int,int]):
         if len(ch) != 1:
@@ -125,43 +116,37 @@ class AtlasModel:
         if not (VISIBLE_ASCII_MIN <= code <= VISIBLE_ASCII_MAX):
             raise ValueError("Character is not visible ASCII (32..126).")
         self.arr[y, x, 0:3] = rgb
-        self.arr[y, x, 3] = code
+        self.arr[y, x, 3] = code  # A=ASCII code
 
     def clear(self, x:int, y:int):
-        self.arr[y, x] = (0,0,0,0)
+        self.arr[y, x] = (0,0,0,0)  # A=0 == clear
 
     def valid_mask(self) -> np.ndarray:
         a = self.arr[...,3]
         return (a==0) | (a==1) | ((a>=VISIBLE_ASCII_MIN) & (a<=VISIBLE_ASCII_MAX))
 
-    # PNG preview with the same rendering rules used in the canvas.
+    # ---------- PNG preview for human inspection ----------
     def export_preview_image(self, scale:int=16, font_path:Optional[str]=None) -> Image.Image:
         h, w = self.h, self.w
         out = Image.new("RGBA", (w*scale, h*scale), (0,0,0,0))
         draw = ImageDraw.Draw(out)
 
-        # checkerboard
+        # checkerboard bg
         c1, c2 = (200,200,200,255), (160,160,160,255)
         check = max(4, scale//2)
         for yy in range(0, h*scale, check):
             for xx in range(0, w*scale, check):
-                fill = c1 if ((xx//check + yy//check) % 2)==0 else c2
-                draw.rectangle([xx,yy,xx+check-1,yy+check-1], fill=fill)
+                draw.rectangle([xx,yy,xx+check-1,yy+check-1], fill=(c1 if ((xx//check + yy//check) % 2)==0 else c2))
 
         # font
         font = None
         if font_path:
-            try:
-                font = ImageFont.truetype(font_path, size=int(scale*0.75))
-            except Exception:
-                font = None
+            try: font = ImageFont.truetype(font_path, size=int(scale*0.75))
+            except Exception: font = None
         if font is None:
-            try:
-                font = ImageFont.truetype("DejaVuSansMono.ttf", size=int(scale*0.75))
-            except Exception:
-                font = ImageFont.load_default()
+            try: font = ImageFont.truetype("DejaVuSansMono.ttf", size=int(scale*0.75))
+            except Exception: font = ImageFont.load_default()
 
-        okmask = self.valid_mask()
         for y in range(h):
             for x in range(w):
                 r,g,b,a = self.arr[y,x]
@@ -179,10 +164,11 @@ class AtlasModel:
                     ty = y0 + (scale - th)//2
                     draw.text((tx,ty), ch, font=font, fill=(int(r),int(g),int(b),255))
                 else:
-                    # invalid - red hatch
-                    draw.rectangle([x0,y0,x1,y1], outline=(255,0,0,255), width=max(1, scale//8))
-                    draw.line([x0,y0,x1,y1], fill=(255,0,0,255), width=max(1, scale//8))
-                    draw.line([x1,y0,x0,y1], fill=(255,0,0,255), width=max(1, scale//8))
+                    # invalid -> red hatch
+                    w0 = max(1, scale//8)
+                    draw.rectangle([x0,y0,x1,y1], outline=(255,0,0,255), width=w0)
+                    draw.line([x0,y0,x1,y1], fill=(255,0,0,255), width=w0)
+                    draw.line([x1,y0,x0,y1], fill=(255,0,0,255), width=w0)
         return out
 
 
@@ -190,15 +176,22 @@ class AtlasPaintApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Atlas Paint (special RGBA alpha)")
-        self.geometry("1000x700")
+        self.geometry("1100x750")
         self.model = AtlasModel(DEFAULT_W, DEFAULT_H)
         self.file_path: Optional[str] = None
 
         self.cell = DEFAULT_CELL
-        self.mode = tk.StringVar(value="pencil")   # "pencil" or "text"
-        self.current_color = (0, 255, 0)           # RGB
-        self.last_char = "A"                       # most recently typed/pasted visible ASCII
+        # modes: pencil, text, stamp
+        self.mode = tk.StringVar(value="pencil")
+        self.current_color = (0, 255, 0)
+        self.last_char = "A"
         self.show_grid = tk.BooleanVar(value=True)
+
+        # --- ASCII art stamp state ---
+        self.stamp_lines: List[str] = []     # list of equal-length strings
+        self.stamp_w = 0
+        self.stamp_h = 0
+        self.stamp_space_clear = tk.BooleanVar(value=True)  # spaces -> clear (A=0)
 
         self._build_ui()
         self._bind_keys()
@@ -207,7 +200,8 @@ class AtlasPaintApp(tk.Tk):
     # ---------- UI ----------
     def _build_ui(self):
         self.menubar = tk.Menu(self)
-        # File menu
+
+        # File
         m_file = tk.Menu(self.menubar, tearoff=0)
         m_file.add_command(label="New...", command=self.new_atlas)
         m_file.add_command(label="Open...", command=self.open_atlas)
@@ -216,14 +210,18 @@ class AtlasPaintApp(tk.Tk):
         m_file.add_separator()
         m_file.add_command(label="Export PNG Preview...", command=self.export_png)
         m_file.add_separator()
+        m_file.add_command(label="Import ASCII Art…", command=self.import_ascii_art)
+        m_file.add_separator()
         m_file.add_command(label="Exit", command=self.destroy)
         self.menubar.add_cascade(label="File", menu=m_file)
 
-        # Tools menu
+        # Tools
         m_tools = tk.Menu(self.menubar, tearoff=0)
         m_tools.add_radiobutton(label="Pencil (opaque pixel)", variable=self.mode, value="pencil",
                                 command=self._update_status)
-        m_tools.add_radiobutton(label="Text (glyphs from last typed char)", variable=self.mode, value="text",
+        m_tools.add_radiobutton(label="Text (glyph from last typed char)", variable=self.mode, value="text",
+                                command=self._update_status)
+        m_tools.add_radiobutton(label="Stamp (place imported ASCII art)", variable=self.mode, value="stamp",
                                 command=self._update_status)
         m_tools.add_separator()
         m_tools.add_command(label="Pick Color…", command=self.pick_color)
@@ -232,7 +230,7 @@ class AtlasPaintApp(tk.Tk):
         m_tools.add_command(label="Validate Atlas", command=self.validate_atlas)
         self.menubar.add_cascade(label="Tools", menu=m_tools)
 
-        # View menu
+        # View
         m_view = tk.Menu(self.menubar, tearoff=0)
         m_view.add_command(label="Cell Size: Smaller", command=lambda: self.set_cell_size(max(8, self.cell-2)))
         m_view.add_command(label="Cell Size: Larger", command=lambda: self.set_cell_size(min(96, self.cell+2)))
@@ -246,11 +244,14 @@ class AtlasPaintApp(tk.Tk):
                        command=self._update_status).pack(side=tk.LEFT)
         tk.Radiobutton(toolbar, text="Text", variable=self.mode, value="text",
                        command=self._update_status).pack(side=tk.LEFT)
+        tk.Radiobutton(toolbar, text="Stamp", variable=self.mode, value="stamp",
+                       command=self._update_status).pack(side=tk.LEFT)
         tk.Button(toolbar, text="Pick Color", command=self.pick_color).pack(side=tk.LEFT, padx=6)
         self.color_preview = tk.Canvas(toolbar, width=24, height=24, highlightthickness=1, highlightbackground="#444")
         self.color_preview.pack(side=tk.LEFT)
-        self._update_color_preview()
         tk.Checkbutton(toolbar, text="Grid", variable=self.show_grid, command=self._redraw_all).pack(side=tk.LEFT, padx=6)
+        tk.Checkbutton(toolbar, text="Spaces = Clear", variable=self.stamp_space_clear,
+                       command=self._update_status).pack(side=tk.LEFT, padx=6)
         tk.Button(toolbar, text="Validate", command=self.validate_atlas).pack(side=tk.LEFT, padx=6)
         tk.Button(toolbar, text="Export PNG", command=self.export_png).pack(side=tk.LEFT, padx=6)
         toolbar.pack(fill=tk.X)
@@ -263,28 +264,28 @@ class AtlasPaintApp(tk.Tk):
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<Leave>", lambda e: self._update_status(None))
+        self.canvas.bind("<Configure>", lambda e: self._redraw_all())
 
         # status bar
         self.status = tk.StringVar()
         status_bar = tk.Label(self, textvariable=self.status, anchor="w", relief=tk.SUNKEN)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self._update_color_preview()
         self._update_status()
 
-        # handle resize
-        self.canvas.bind("<Configure>", lambda e: self._redraw_all())
-
     def _bind_keys(self):
-        # Capture printable ASCII to set last_char
+        # capture printable ASCII to set last_char
         self.bind("<Key>", self.on_key)
-        # Paste support: Ctrl/Cmd+V
+        # paste support for last_char: Ctrl/Cmd+V
         self.bind_all("<Control-v>", self.on_paste)
-        self.bind_all("<Command-v>", self.on_paste)  # mac
+        self.bind_all("<Command-v>", self.on_paste)
 
-        # Quick toggles
+        # quick mode toggles
         self.bind("<Key-p>", lambda e: self._set_mode("pencil"))
         self.bind("<Key-t>", lambda e: self._set_mode("text"))
+        self.bind("<Key-s>", lambda e: self._set_mode("stamp"))
 
-        # +/- to change cell size
+        # +/- zoom
         self.bind("<Key-minus>", lambda e: self.set_cell_size(max(8, self.cell-2)))
         self.bind("<Key-equal>", lambda e: self.set_cell_size(min(96, self.cell+2)))  # '=' is '+'
 
@@ -300,28 +301,38 @@ class AtlasPaintApp(tk.Tk):
         pos = self.parse_xy(event)
         if pos is None: return
         x,y = pos
-        if self.mode.get() == "pencil":
+        m = self.mode.get()
+        if m == "pencil":
             self.model.set_pixel(x,y,self.current_color)
-        else:
-            # text mode: stamp last_char
+            self._draw_cell(x,y)
+        elif m == "text":
             try:
                 self.model.set_char(x,y,self.last_char,self.current_color)
             except ValueError:
                 messagebox.showwarning("Invalid char", f"'{repr(self.last_char)}' is not visible ASCII (32..126).")
-        self._draw_cell(x,y)
+            self._draw_cell(x,y)
+        elif m == "stamp":
+            self.stamp_at(x, y)
+            self._redraw_all()  # redraw whole area to update quickly
 
     def on_left_drag(self, event):
         pos = self.parse_xy(event)
         if pos is None: return
         x,y = pos
-        if self.mode.get() == "pencil":
+        m = self.mode.get()
+        if m == "pencil":
             self.model.set_pixel(x,y,self.current_color)
-        else:
+            self._draw_cell(x,y)
+        elif m == "text":
             try:
                 self.model.set_char(x,y,self.last_char,self.current_color)
             except ValueError:
                 pass
-        self._draw_cell(x,y)
+            self._draw_cell(x,y)
+        elif m == "stamp":
+            # drag places repeatedly (like a brush stamp)
+            self.stamp_at(x, y)
+            self._redraw_all()
 
     def on_right_click(self, event):
         pos = self.parse_xy(event)
@@ -333,6 +344,15 @@ class AtlasPaintApp(tk.Tk):
     def on_motion(self, event):
         pos = self.parse_xy(event)
         self._update_status(pos)
+        if self.mode.get() == "stamp" and self.stamp_w>0 and self.stamp_h>0 and pos:
+            # draw a ghost rectangle showing placement bounds
+            self.canvas.delete("ghost")
+            x,y = pos
+            x0,y0 = x*self.cell, y*self.cell
+            x1,y1 = (x+self.stamp_w)*self.cell, (y+self.stamp_h)*self.cell
+            self.canvas.create_rectangle(x0,y0,x1,y1, outline="#00aaff", width=2, dash=(4,2), tags=("ghost",))
+        else:
+            self.canvas.delete("ghost")
 
     def on_key(self, event):
         if event.char and len(event.char)==1:
@@ -340,7 +360,6 @@ class AtlasPaintApp(tk.Tk):
             if VISIBLE_ASCII_MIN <= ord(c) <= VISIBLE_ASCII_MAX:
                 self.last_char = c
                 self._update_status()
-        # ignore other keys
 
     def on_paste(self, event=None):
         try:
@@ -348,7 +367,6 @@ class AtlasPaintApp(tk.Tk):
         except Exception:
             return
         if not s: return
-        # take the first visible ASCII char
         for ch in s:
             if VISIBLE_ASCII_MIN <= ord(ch) <= VISIBLE_ASCII_MAX:
                 self.last_char = ch
@@ -386,7 +404,6 @@ class AtlasPaintApp(tk.Tk):
     def open_atlas(self):
         path = filedialog.askopenfilename(title="Open raw atlas", filetypes=[("Raw RGBA", "*.bin *.raw *.*")])
         if not path: return
-        # ask for dimensions
         w = simpledialog.askinteger("Open Atlas", "Width (cells):", initialvalue=self.model.w, minvalue=1, maxvalue=16384)
         if w is None: return
         h = simpledialog.askinteger("Open Atlas", "Height (cells):", initialvalue=self.model.h, minvalue=1, maxvalue=16384)
@@ -400,6 +417,11 @@ class AtlasPaintApp(tk.Tk):
         self._redraw_all()
 
     def save_atlas(self):
+        """
+        Writes the current atlas to disk as raw RGBA8.
+        The array shape is (height, width, 4), dtype=uint8.
+        Order is row-major, top-to-bottom, left-to-right.
+        """
         if not self.file_path:
             return self.save_atlas_as()
         try:
@@ -428,13 +450,92 @@ class AtlasPaintApp(tk.Tk):
             return
         self._flash_status(f"Exported preview: {os.path.basename(path)}")
 
+    # ---------- ASCII art import / stamp ----------
+    def import_ascii_art(self):
+        """
+        Select a .txt file and load it as a rectangular stamp.
+        - Keeps visible ASCII (32..126). Others are dropped.
+        - Lines are right-padded with spaces to make a rectangle.
+        - Spaces can be treated as clear (toggle on toolbar) or as glyph ' ' (A=32).
+        """
+        path = filedialog.askopenfilename(title="Import ASCII Art (.txt)",
+                                          filetypes=[("Text files","*.txt"), ("All files","*.*")])
+        if not path: return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                raw_lines = f.read().splitlines()
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
+            return
+        # Filter to visible ASCII or space; drop others
+        filt: List[str] = []
+        max_w = 0
+        for line in raw_lines:
+            kept = []
+            for ch in line:
+                o = ord(ch)
+                if VISIBLE_ASCII_MIN <= o <= VISIBLE_ASCII_MAX:
+                    kept.append(ch)
+                # else drop
+            s = "".join(kept)
+            filt.append(s)
+            max_w = max(max_w, len(s))
+        # Remove leading/trailing fully-empty lines for neatness
+        while filt and len(filt[0])==0: filt.pop(0)
+        while filt and len(filt[-1])==0: filt.pop()
+        # Right-pad to rectangle with spaces
+        if not filt:
+            messagebox.showwarning("Import", "The file had no visible ASCII to import.")
+            return
+        padded = [ln.ljust(max_w, " ") for ln in filt]
+        self.stamp_lines = padded
+        self.stamp_w = max_w
+        self.stamp_h = len(padded)
+        self.mode.set("stamp")
+        self._flash_status(f"Loaded ASCII stamp {self.stamp_w}x{self.stamp_h} from {os.path.basename(path)}")
+
+    def stamp_at(self, x:int, y:int):
+        """
+        Place the loaded ASCII art at top-left cell (x,y).
+        Applies current color to all non-space glyphs.
+        If 'Spaces = Clear' is ON: spaces clear cells (A=0).
+        Else: spaces are real glyphs (A=32).
+        Clips at atlas bounds.
+        """
+        if not (self.stamp_w and self.stamp_h and self.stamp_lines):
+            messagebox.showinfo("Stamp", "No ASCII art loaded. Use File → Import ASCII Art…")
+            return
+        space_as_clear = self.stamp_space_clear.get()
+        wlim = min(self.model.w - x, self.stamp_w)
+        hlim = min(self.model.h - y, self.stamp_h)
+        if wlim <= 0 or hlim <= 0:
+            self._flash_status("Stamp out of bounds (nothing placed).")
+            return
+        for j in range(hlim):
+            row = self.stamp_lines[j]
+            for i in range(wlim):
+                ch = row[i]
+                if ch == " ":
+                    if space_as_clear:
+                        self.model.clear(x+i, y+j)
+                    else:
+                        # space as visible ASCII (A=32)
+                        try: self.model.set_char(x+i, y+j, " ", self.current_color)
+                        except ValueError: pass
+                else:
+                    # glyph
+                    try:
+                        self.model.set_char(x+i, y+j, ch, self.current_color)
+                    except ValueError:
+                        # ignore non-visible (shouldn't occur after filtering)
+                        pass
+
     def validate_atlas(self):
         ok = self.model.valid_mask()
         total = ok.size
         bad = int((~ok).sum())
-        pct = 100*(total-bad)/total
+        pct = 100*(total-bad)/total if total else 100.0
         messagebox.showinfo("Validation", f"Valid cells: {total-bad}/{total} ({pct:.2f}%)")
-        # draw invalid overlays immediately visible
         self._redraw_all()
 
     # ---------- Drawing ----------
@@ -445,9 +546,7 @@ class AtlasPaintApp(tk.Tk):
         cw, ch = self._canvas_size()
         self.canvas.delete("all")
         self.canvas.config(scrollregion=(0,0,cw,ch))
-        # checkerboard
         self._draw_checkerboard()
-        # cells
         for y in range(self.model.h):
             for x in range(self.model.w):
                 self._draw_cell(x,y,skip_bg=True)
@@ -472,36 +571,26 @@ class AtlasPaintApp(tk.Tk):
             self.canvas.create_line(0,y,cw,y, fill="#444")
 
     def _draw_cell(self, x:int, y:int, skip_bg:bool=False):
-        # delete any previous items for this cell
         tag = f"cell-{x}-{y}"
         self.canvas.delete(tag)
-
         x0, y0 = x*self.cell, y*self.cell
         x1, y1 = x0+self.cell, y0+self.cell
-
         r,g,b,a = self.model.arr[y,x]
         if a == 0:
-            # transparent; checkerboard shows through
-            pass
+            pass  # checkerboard shows through
         elif a == 1:
             self.canvas.create_rectangle(x0,y0,x1,y1, outline="", fill='#%02x%02x%02x'% (r,g,b), tags=(tag,))
         elif VISIBLE_ASCII_MIN <= a <= VISIBLE_ASCII_MAX:
-            # draw a subtle background so glyph edge is clearer
-            self.canvas.create_rectangle(x0,y0,x1,y1, outline="", fill="", tags=(tag,))
-            ch = chr(int(a))
-            # Fit text in cell
-            # Tk font sizing is in points; approximate with pixels
             size = max(6, int(self.cell*0.8))
-            font = ("Courier New", size)  # monospace-ish; system fallback if missing
-            # center text
-            self.canvas.create_text((x0+x1)//2, (y0+y1)//2, text=ch,
+            font = ("Courier New", size)  # monospace-ish, system fallback if missing
+            self.canvas.create_text((x0+x1)//2, (y0+y1)//2, text=chr(int(a)),
                                     font=font, fill='#%02x%02x%02x'% (r,g,b),
                                     tags=(tag,))
         else:
-            # invalid: draw red X
-            self.canvas.create_rectangle(x0,y0,x1,y1, outline="#ff0000", width=max(1, self.cell//8), tags=(tag,))
-            self.canvas.create_line(x0,y0,x1,y1, fill="#ff0000", width=max(1, self.cell//8), tags=(tag,))
-            self.canvas.create_line(x1,y0,x0,y1, fill="#ff0000", width=max(1, self.cell//8), tags=(tag,))
+            w0 = max(1, self.cell//8)
+            self.canvas.create_rectangle(x0,y0,x1,y1, outline="#ff0000", width=w0, tags=(tag,))
+            self.canvas.create_line(x0,y0,x1,y1, fill="#ff0000", width=w0, tags=(tag,))
+            self.canvas.create_line(x1,y0,x0,y1, fill="#ff0000", width=w0, tags=(tag,))
 
     def _update_color_preview(self):
         self.color_preview.delete("all")
@@ -511,23 +600,25 @@ class AtlasPaintApp(tk.Tk):
         mode = self.mode.get()
         color = '#%02x%02x%02x' % self.current_color
         char_info = f"char='{self.last_char}' (alpha={ord(self.last_char)})"
+        stamp_info = ""
+        if self.stamp_w and self.stamp_h:
+            stamp_info = f" | stamp={self.stamp_w}x{self.stamp_h} (spaces={'clear' if self.stamp_space_clear.get() else 'glyph'})"
         coord = ""
         if pos:
             x,y = pos
             coord = f" | cell=({x},{y})"
             r,g,b,a = self.model.arr[y,x]
             coord += f" | RGBA=({r},{g},{b},{a})"
-        self.status.set(f"Mode: {mode} | Color: {color} | {char_info} | Size: {self.model.w}x{self.model.h}{coord}")
+        self.status.set(f"Mode: {mode} | Color: {color} | {char_info}{stamp_info} | Size: {self.model.w}x{self.model.h}{coord}")
 
     def _flash_status(self, text:str):
         self.status.set(text)
-        self.after(1500, self._update_status)
+        self.after(1600, self._update_status)
 
 # ---------- Main ----------
 def main():
-    # optional CLI for starting a specific file (width/height)
-    # usage: python atlas_paint.py [path] [width] [height]
     app = AtlasPaintApp()
+    # Optional startup file: python atlas_paint.py path [width] [height]
     if len(sys.argv) >= 2 and os.path.exists(sys.argv[1]):
         path = sys.argv[1]
         try:

@@ -1,5 +1,5 @@
 // js/ascii_pass_shader.js
-// Shaders for the GPU ASCII pass (WebGL1-compatible), with optional modal smoothing:
+// Shaders for the GPU ASCII pass, with optional modal smoothing:
 //  • Vertex shader: full-screen quad pass-through
 //  • Fragment shader: ramp quantization, optional modal smoothing (majority vote)
 //  • Smoothing NEVER affects UI overrides (alpha-encoded ASCII), and smoothing DOES NOT

@@ -135,6 +135,34 @@ function attachInput() {
 }
 
 /* ------------------------------ App setup ------------------------------ */
+
+// Flip an RGBA uint8 buffer vertically (top-left origin → bottom-left origin)
+function flipRGBA_Y(bytes, width, height) {
+  const rowBytes = width * 4;
+  const out = new Uint8Array(bytes.length);
+  for (let y = 0; y < height; y++) {
+    const srcOff = y * rowBytes;
+    const dstOff = (height - 1 - y) * rowBytes;
+    out.set(bytes.subarray(srcOff, srcOff + rowBytes), dstOff);
+  }
+  return out;
+}
+
+async function loadAtlasBin(url, width, height) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`atlas fetch failed: ${res.status}`);
+  const buf = await res.arrayBuffer();
+  const raw = new Uint8Array(buf);
+  const expected = width * height * 4;
+  if (raw.length !== expected) {
+    console.warn(`[atlas] size mismatch: got ${raw.length}, expected ${expected}`);
+    // proceed anyway; we'll clamp on upload
+  }
+  // IMPORTANT: pre-flip rows so texelFetch's (0,0)=bottom-left matches our atlas' (0,0)=top-left
+  const pixels = flipRGBA_Y(raw, width, height);
+  return { width, height, pixels };
+}
+
 function measureCharSize() {
   const el = document.getElementById('measure');
   const rect = el.getBoundingClientRect();
@@ -190,6 +218,19 @@ function init() {
 
   // Scene and camera
   state.scene = createScene();
+
+  // Push the scene once so you can render immediately without the atlas.
+  if (typeof setScene === 'function') setScene(state.scene);
+
+  // Kick an async load of the raw 32×32 atlas and then update the scene.
+  loadAtlasBin('atlas.bin', 32, 32)
+    .then((atlas) => {
+      // Pre-flipped pixels so shader can use direct texelFetch without a Y-conversion.
+      state.scene.atlas = atlas;
+      setScene(state.scene); // this triggers the backend to upload the texture
+    })
+    .catch((err) => console.warn('[atlas] load failed:', err));
+
   if (state.scene?.camera?.pos) {
     const c = state.scene.camera;
     camera.pos.x = c.pos[0]; camera.pos.y = c.pos[1]; camera.pos.z = c.pos[2];

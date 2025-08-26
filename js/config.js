@@ -45,7 +45,7 @@ export const config = {
 
   // ---- Path tracer core params ----
   PATH_TRACER: {
-    SAMPLES_PER_BATCH: 32,
+    SAMPLES_PER_BATCH: 64,
     MAX_BOUNCES: 5,
     LIGHT_COLOR: [16.86, 10.76, 8.2], // stable default "area light" color
     GAMMA_EXP: 1.0,                   // *** no gamma correction ***

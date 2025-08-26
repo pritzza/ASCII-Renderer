@@ -19,9 +19,9 @@ export class TracerPass {
   constructor(gl, quadVbo, PT) {
     // Soft limits (small defaults to stay within WebGL uniform caps)
     this.lims = {
-      MAX_SPHERES: (PT?.LIMITS?.MAX_SPHERES ?? 4) | 0,
-      MAX_TRIS:    (PT?.LIMITS?.MAX_TRIS    ?? 16) | 0,
-      MAX_QUADS:   (PT?.LIMITS?.MAX_QUADS   ?? 8) | 0,
+      MAX_SPHERES: (PT?.LIMITS?.MAX_SPHERES ?? 8) | 0,
+      MAX_TRIS:    (PT?.LIMITS?.MAX_TRIS    ?? 64) | 0,
+      MAX_QUADS:   (PT?.LIMITS?.MAX_QUADS   ?? 32) | 0,
     };
 
     const { vs, fs } = buildTracerSources({ ...PT, LIMITS: this.lims });

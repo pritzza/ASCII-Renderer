@@ -1,55 +1,72 @@
 // js/scene.js
 import { createSceneBuilder, MaterialIds } from './render/scene_api.js';
 
-function addCube(sb, center, size, material = MaterialIds.WHITE) {
-  const [cx, cy, cz] = center;
-  const [sx, sy, sz] = Array.isArray(size) ? size : [size, size, size];
-  const hx = sx * 0.5, hy = sy * 0.5, hz = sz * 0.5;
-  const x0 = cx - hx, x1 = cx + hx;
-  const y0 = cy - hy, y1 = cy + hy;
-  const z0 = cz - hz, z1 = cz + hz;
-
-  const v000 = [x0, y0, z0], v100 = [x1, y0, z0], v110 = [x1, y1, z0], v010 = [x0, y1, z0];
-  const v001 = [x0, y0, z1], v101 = [x1, y0, z1], v111 = [x1, y1, z1], v011 = [x0, y1, z1];
-
-  sb.addQuad(v001, v101, v111, v011, material); // +Z
-  sb.addQuad(v100, v000, v010, v110, material); // -Z
-  sb.addQuad(v101, v100, v110, v111, material); // +X
-  sb.addQuad(v000, v001, v011, v010, material); // -X
-  sb.addQuad(v010, v011, v111, v110, material); // +Y (top)
-  sb.addQuad(v000, v100, v101, v001, material); // -Y (bottom)
-  return sb;
-}
-
 export function createScene() {
   const sb = createSceneBuilder();
 
-  // Camera pose (from your log)
-  sb.setCameraPose([-2.023, 2.500, 7.376], { yaw: -1.0, pitch: -0.4 });
+  // ---------------- Camera ----------------
+  const camPos = [0.0, 1.5, 6.0];
+  sb.setCameraPose(camPos, { yaw: 0.0, pitch: 0.0 });
 
-  // Ground (quad instead of infinite plane; PT-only geometry)
-  const G = 20.0;
-  const g00 = [-G, 0.0, -G], g10 = [ G, 0.0, -G], g11 = [ G, 0.0,  G], g01 = [-G, 0.0,  G];
-  sb.addQuad(g00, g10, g11, g01, MaterialIds.WHITE);
+  // ---------------- Large White Cube (6 quads) ----------------
+  const L = 8.0; // half-size
+  const H = 16.0; // full cube height
 
-  // Spheres
-  sb.addSphere([-2.0, 1.0,  3.2], 1.0,  MaterialIds.WHITE);
-  sb.addSphere([ 0.6, 0.75, 2.1], 0.75, MaterialIds.GLASS);
-  sb.addSphere([ 2.4, 1.25, 4.2], 1.25, MaterialIds.RED);
+  // floor
+  sb.addQuad([-L, 0, -L], [ L, 0, -L], [ L, 0, L], [-L, 0, L], MaterialIds.WHITE);
+  // ceiling
+  sb.addQuad([-L, H, -L], [ L, H, -L], [ L, H, L], [-L, H, L], MaterialIds.WHITE);
+  // back wall
+  sb.addQuad([-L, 0, -L], [ L, 0, -L], [ L, H, -L], [-L, H, -L], MaterialIds.WHITE);
+  // front wall
+  sb.addQuad([-L, 0, L], [ L, 0, L], [ L, H, L], [-L, H, L], MaterialIds.WHITE);
+  // left wall
+  sb.addQuad([-L, 0, -L], [-L, 0, L], [-L, H, L], [-L, H, -L], MaterialIds.WHITE);
+  // right wall
+  sb.addQuad([ L, 0, -L], [ L, 0, L], [ L, H, L], [ L, H, -L], MaterialIds.WHITE);
 
-  // Cubes
-  addCube(sb, [-3.2, 0.50, 5.0],  1.0,               MaterialIds.WHITE);
-  addCube(sb, [ 1.8, 0.60, 5.4], [1.2, 1.2, 1.2],    MaterialIds.GREEN);
+  // ---------------- Poster Quad ----------------
+  const texW = 26, texH = 24;
+  const posterScale = 0.12;
+  const posterW = texW * posterScale;
+  const posterH = texH * posterScale * 2;
 
-  // Static emissives
-  sb.addSphere([3.6, 0.5, 3.0], 0.30, MaterialIds.LIGHT);
-  addCube(sb, [0.0, 0.25, 1.2], 0.50, MaterialIds.LIGHT);
+  const posterZ = camPos[2] - 3.0;
+  const px = camPos[0];
+  const py = camPos[1] + 1;
 
-  // Area light sphere (PT uses this for NEE)
-  sb.setAreaLight([0.0, 4.5, 2.5], 0.75, { auto: false });
+  const A = [px - posterW * 0.5, py - posterH * 0.5, posterZ];
+  const B = [px + posterW * 0.5, py - posterH * 0.5, posterZ];
+  const C = [px + posterW * 0.5, py + posterH * 0.5, posterZ];
+  const D = [px - posterW * 0.5, py + posterH * 0.5, posterZ];
 
-  // Optional: integer atlas size (only needed if you plan to texelFetch from it)
-  // sb.setTextureAtlasSize(1024, 1024);
+  const uvA = [0, 24];
+  const uvB = [26, 24];
+  const uvC = [26, 0];
+  const uvD = [0, 0];
+
+  sb.addQuad(A, B, C, D, MaterialIds.WHITE, uvA, uvB, uvC, uvD);
+
+  // ---------------- Spheres ----------------
+  sb.addSphere([-3.0, 1.2, camPos[2] - 2.0], 1.0, MaterialIds.GLASS); // glass sphere
+  sb.addSphere([ 3.0, 1.2, camPos[2] - 2.5], 1.0, MaterialIds.RED);   // colored sphere
+
+  // ---------------- Colored Lights ----------------
+  const lightSize = 3;
+  const cy = 6.0;
+
+  function addLight(cx, cz, mat) {
+    const A = [cx - lightSize, cy, cz - lightSize];
+    const B = [cx + lightSize, cy, cz - lightSize];
+    const C = [cx + lightSize, cy, cz + lightSize];
+    const D = [cx - lightSize, cy, cz + lightSize];
+    sb.addQuad(A, B, C, D, mat);
+  }
+
+  addLight(-4.0, camPos[2], MaterialIds.LIGHT_RED);
+  addLight( 4.0, camPos[2], MaterialIds.LIGHT_BLUE);
+  addLight( 0.0, camPos[2] - 5.0, MaterialIds.LIGHT_GREEN);
+  addLight( 0.0, camPos[2] + 5.0, MaterialIds.LIGHT_YELLOW);
 
   return sb.toObject();
 }
